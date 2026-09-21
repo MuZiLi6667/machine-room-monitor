@@ -1,0 +1,14 @@
+# 源码与脚本统一用 LF 换行。
+# 原因：本项目在 Windows 上编辑、在 Linux 上编译；若被转成 CRLF，
+#       Makefile 会因行尾的 \r 报 "missing separator"，shell 脚本也会报错。
+*.c      text eol=lf
+*.h      text eol=lf
+*.sql    text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+Makefile text eol=lf
+
+# 二进制文件不要做换行转换
+*.hex    binary
+*.exe    binary
+*.png    binary

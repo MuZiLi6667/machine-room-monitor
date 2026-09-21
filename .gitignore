@@ -1,0 +1,28 @@
+# 编译产物（server-linux）
+server-linux/build/
+server-linux/server
+*.o
+*.d
+
+# 任务A（Keil）产物
+stm32-firmware/**/Objects/
+stm32-firmware/**/Listings/
+stm32-firmware/**/*.hex
+stm32-firmware/**/*.axf
+stm32-firmware/**/*.uvguix.*
+
+# 任务B（Qt）产物
+client-qt/**/build-*/
+client-qt/**/*.pro.user
+client-qt/release/
+client-qt/debug/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
