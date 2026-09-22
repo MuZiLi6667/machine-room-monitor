@@ -7,7 +7,7 @@
 > 2. 严格按【验收标准】逐条自测，全部通过后在该步骤前的复选框打勾，并在 `docs/调试记录-C.md` 记录过程。
 > 3. 接口字段（JSON格式、表结构、端口、阈值）**以 `docs/接口规范.md` 为唯一依据，禁止擅改**。
 >
-> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☑　S4 ☑　S5 ☑　S6 ☐　S7 ☐　S8 ☐
+> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☑　S4 ☑　S5 ☑　S6 ☑　S7 ☐　S8 ☐
 
 ---
 
@@ -343,7 +343,7 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 
 ---
 
-### ☐ S6 分析线程 + ANALYSIS 推送（对应任务书 C4.3，可选 C4.4，约0.5~1天）
+### ☑ S6 分析线程 + ANALYSIS 推送（对应任务书 C4.3，可选 C4.4，约0.5~1天）
 
 **目标**：`analysis.c`——独立线程每 60s 统计最近 10 分钟数据，写 `analysis_result` 并向在线客户端推送 ANALYSIS。
 
@@ -378,6 +378,20 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 | S6-5 | （做了C4.4时）`./server -t 15 -w 60` | 15 秒即产出统计，窗口为 1 分钟 |
 
 **常见坑**：std=0 或单样本时 STDDEV_POP 返回 0/NULL，JSON 里要给 0 而非 null；多 client 在线时逐 client 组包，别把 A 的统计发给 B。
+
+> 实现记录：
+> 1. **统计明细经 db 模块的内存缓存交给 analysis.c**：`db_run_analysis()` 的冻结签名只返回行数，带不出每组的明细，于是在 db.c 内部留一份只读副本，用**新增**的 `db_analysis_count()` / `db_analysis_row()` / `db_analysis_period()` 读出来组包——与 S5 的 `db_threshold_get()` 同一套路（新增而非改动冻结签名）。写者与读者都是分析线程，无需加锁。
+> 2. **窗口两端点同时是 SQL 字面量与推送字段**：`db_run_analysis()` 取服务器当前时刻生成 `period_start/period_end`，既作为 `WHERE collect_time >= '…' AND collect_time <= '…'` 的字面量，又原样进入 ANALYSIS。推送里写的窗口与实际统计的窗口逐字节一致，S6-2 的手工比对可以原样复现同一期。
+> 3. **over_count 用 SQL 的 CASE 条件求和**，条件由内存阈值缓存生成（与 `alarm_check` 同源同口径：严格不等号、NULL 侧不检查、无配置行的传感器不参与），一条聚合查询搞定，不额外拉行、也不再查一次库。
+> 4. **"禁止把 A 的统计发给 B"设了两道闸**：组包时只挑 client_id 与本连接**逐字符相等**的组；发送前再用 `session_client_id_copy()` 复核该 fd 现在仍属于这个 client_id（快照到推送之间 fd 可能被回收复用）。另新增 `session_snapshot_logged()`——fd 与 client_id 在同一把锁内一次取齐。
+> 5. **推送值按 `DECIMAL(10,2)` 规整**：cJSON 对无法用 15 位有效数字往返的 double 打 `%1.17g`，首轮实测推送出 `"std":3.8810187113933439`，而库里存的是 `3.88`。新增 `analysis_round2()` 后两边逐位相同，客户端也不必显示一长串尾数。
+> 6. **退出用 `pthread_cond_timedwait`，不用"分段 sleep + volatile 标志"**：volatile 不做线程间同步，helgrind 实测报 2 处数据竞争（堆栈直指该标志，见问题 35）；改互斥锁 + 条件变量后归零，且 `analysis_stop()` 叫醒立即生效。main 收尾顺序是 `analysis_stop()` → `pthread_join()` → `db_shutdown()`（分析线程有自己的 MySQL 连接，必须走在 `mysql_library_end()` 之前）。
+> 7. **db.c 新增一把建连锁 `g_conn_lock`**：helgrind 在"分析线程与工作线程并发首次建连"时报告 libmysqlclient 内部的数据竞争（堆栈全在库内），把建连/关闭串行化即可——这是每线程一生一次的罕见事件，已有连接的快路径完全不碰锁（问题 36）。
+> 8. **S6-4 的口径选"无数据不推送"**（不是推空 `sensors` 数组），已写进 `运行说明.md` §5.5。
+> 9. getopt（可选加分 C4.4）：`-p 端口 -t 周期 -w 窗口`，默认 **9000 / 60 / 600**；参数**整串校验**（拒绝 `abc`、越界、未知选项），非法即打印用法退出，不会带着坏配置启动。
+> 10. 新增错误码/字段：**无**。接口规范 §3.1/§3.2/§4 零改动，ANALYSIS 的字段名与顺序逐字对齐 §3.1。
+>
+> 验收 S6-1~S6-5 全过（另有"不把 A 的统计发给 B""离线只入库不推送""helgrind 零竞争"三项附加验证），命令与实测输出见 `docs/调试记录-C.md` §二十一。
 
 ---
 

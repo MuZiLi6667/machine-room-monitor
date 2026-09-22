@@ -15,6 +15,8 @@
 #ifndef SESSION_H
 #define SESSION_H
 
+#include "config.h"     /* CLIENT_ID_MAX_LEN：下面的会话快照结构体要用 */
+
 /* 登记一个新连接（accept 成功后调用）。成功返回 0；会话表满返回 -1。 */
 int  session_add(int fd);
 
@@ -75,5 +77,23 @@ int  session_collect_dead(int timeout_sec, int *fds, int cap);
 int  session_client_id_copy(int fd, char *out, int cap);
 /* 当前活跃会话数量（日志用）。 */
 int  session_count(void);
+
+/* ---- S6 新增 ---- */
+/* 一条"已登录、且未被标记踢除"的会话快照（fd 与 client_id 配套）。 */
+typedef struct {
+    int  fd;
+    char client_id[CLIENT_ID_MAX_LEN + 1];
+} session_snapshot_t;
+
+/* 取当前已登录会话的快照（最多 cap 个），返回实际个数。
+ * 空槽、未登录、已被 session_login 标记待踢的槽位都不会出现——分析线程据此
+ * 决定"把统计推给谁"。
+ *
+ * fd 与 client_id 在**同一把锁内一次取齐**：分两次（先取 fd 列表、再逐个查
+ * client_id）会在两次调用之间被踢旧/超时回收插空，取回来的 fd 可能已经属于
+ * 另一个 client。即便如此，返回后的 fd 仍可能在推送前被主线程回收并被新连接
+ * 复用，故调用方**推送前**还要用 session_client_id_copy() 复核一次
+ * （见 analysis.c：这是"禁止把 A 的统计发给 B"的最后一道闸）。 */
+int  session_snapshot_logged(session_snapshot_t *out, int cap);
 
 #endif /* SESSION_H */

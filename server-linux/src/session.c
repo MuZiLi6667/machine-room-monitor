@@ -516,3 +516,36 @@ int session_count(void)
     pthread_mutex_unlock(&g_session_lock);
     return n;
 }
+
+/*
+ * S6：已登录会话快照（分析线程的推送对象来源）。
+ * 排除三种槽位：空槽、未登录、已被标记待踢（马上要被主线程关掉，不必再推）。
+ * fd 与 client_id 在同一把锁内一次取齐，避免"取 fd"与"查 client_id"两次
+ * 调用之间连接被顶替/回收，导致 fd 与 client_id 张冠李戴（详见 session.h）。
+ */
+int session_snapshot_logged(session_snapshot_t *out, int cap)
+{
+    int i;
+    int n = 0;
+
+    if (out == NULL || cap <= 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_session_lock);
+    session_ensure_init();
+
+    for (i = 0; i < MAX_SESSIONS && n < cap; i++) {
+        session_t *s = &g_sessions[i];
+
+        if (s->fd < 0 || !s->logged || s->kick) {
+            continue;
+        }
+        out[n].fd = s->fd;
+        snprintf(out[n].client_id, sizeof(out[n].client_id), "%s", s->client_id);
+        n++;
+    }
+
+    pthread_mutex_unlock(&g_session_lock);
+    return n;
+}

@@ -1117,3 +1117,198 @@ probe 跑在**宿主机**上（ts 是宿主机时钟），而 ALARM 的 ts 由�
 6. **`alarm_send` 与 `proto_reply` 同构但各写各的**：JSON 文本与 `'\n'` 必须在同一次 `net_send` 里发出（拆开会被别的线程插队）。这是刻意保留的十行重复，不要为了"复用"去改 proto 的对外契约。
 7. 本步跑过一次 **helgrind**（并发告警场景，`ERROR SUMMARY: 0 errors`，见 §十八），主要是为了验证 S5 新增的"工作线程只读阈值缓存"这条跨线程路径——结论是安全，靠的是"启动阶段填好 + 之后只读 + `pthread_create` 的 happens-before"，**不要**日后为了"保险"给它加锁（加锁反而会引入锁序问题）。memcheck 仍未跑（属 S7）；已知形态与 S4 相同：常驻工作线程的 TLS 表现为 `still reachable`，判读只看 `definitely lost` 是否为 0。
 8. 日志里每条告警一行 `client_id=X 告警：sensor=n(名称) value=… >/< threshold=… level=… msg="…" ts=…`，S7 压测统计告警条数直接 `grep -c '告警：'` 即可（与 `alarm_log` 的行数应一致）。
+
+---
+
+## 二十、S6 阶段问题记录（统计分析与 ANALYSIS 推送）
+
+### 问题 34：helgrind "进程已退出" 是误判 —— `pkill -x valgrind` 什么也没杀到
+
+**现象**
+第一次 helgrind 跑完（probe 收发正常），执行 `pkill -INT -x valgrind; pgrep -a valgrind` → **无输出**，据此判定"进程已退出"，但 `/tmp/hg6.log` 里只有 6 行头部、没有 `ERROR SUMMARY`。紧接着再起一个 helgrind 实例，服务器日志报：
+
+```
+[ERROR] bind() 端口 9000 失败：Address already in use
+```
+
+**定位**
+`ss -ltnp | grep 9000` 显示端口属于 **pid=8288 且仍在监听**，`ps -ef` 里它跑得好好的；`cat /proc/8288/comm` 得到 `helgrind-amd64-`。
+
+**原因**
+pgrep/pkill 默认按**进程名（comm，最长 15 字符）**匹配，而 valgrind 载入 helgrind 工具后进程名被改写成 `helgrind-amd64-` —— `-x valgrind` 与 `-x server` **都匹配不到它**。这次没筛到任何进程，`pgrep` 也同样筛不到，我把它读成了"已退出"，于是一台仍在运行的服务器被当成了僵尸；报告没写完的真正原因是**进程根本还活着**（valgrind 的报告要等进程退出才落盘）。
+
+**解决**
+改用命令行匹配取 PID，再显式发信号：
+
+```bash
+PID=$(pgrep -f '[v]algrind.bin'); kill -INT $PID
+```
+
+（`[v]` 是为了让 pgrep 不匹配到承载这条命令的 ssh/bash 自己）。valgrind 会把 SIGINT 转发给服务器，服务器走完优雅退出后 valgrind 才写完整报告。判读口径已写进 `运行说明.md` §6。
+
+### 问题 35：helgrind 抓到分析线程退出标志的数据竞争（**真实缺陷**）
+
+**现象**
+S6 首轮 helgrind：`ERROR SUMMARY: 2 errors from 2 contexts`，两条堆栈互为读写对：
+
+```
+Possible data race during write of size 4 at 0x19F7E0 by thread #1
+   at 0x10E354: analysis_stop (analysis.c:250)   by main (main.c:190)
+This conflicts with a previous read of size 4 by thread #6
+   at 0x10E312: analysis_thread (analysis.c:233)
+Address 0x19f7e0 is 0 bytes inside data symbol "g_stop"
+```
+
+**定位**
+`g_stop` 是分析线程的退出标志：主线程在 `analysis_stop()` 里写、分析线程在循环里读，两者之间**没有任何同步**（当时的写法是 `static volatile int` + "分段 sleep 检查"）。
+
+**原因**
+`volatile` 只保证"这次访问不会被编译器优化掉"，**不构成线程间同步**、不建立 happens-before；C 标准下这是未定义行为。helgrind 报得没错，这是真实的并发缺陷，与 S2 那次 cJSON 全局是同一类。
+
+**解决**
+改成互斥锁 + 条件变量，用 `pthread_cond_timedwait` 做"定时等待 + 可被打断"：
+
+```c
+static pthread_mutex_t g_stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_stop_cond = PTHREAD_COND_INITIALIZER;
+static int             g_stop      = 0;      /* 受 g_stop_lock 保护 */
+```
+
+`analysis_stop()` 里 `pthread_mutex_lock` → `g_stop = 1` → `pthread_cond_signal` → `unlock`。顺带把"退出最多等 1 秒"变成立即生效。重跑 helgrind 后这条竞争消失。
+
+### 问题 36：并发首次建连时 libmysqlclient 内部被报数据竞争（真实缺陷，落在库的路径上）
+
+**现象**
+修掉问题 35 后重跑，仍有 `ERROR SUMMARY: 2 errors from 2 contexts`，但堆栈换了：
+
+```
+Possible data race during read/write of size 8 at 0x4F8BE40
+   at 0x489CD0F: ??? (in libmysqlclient.so.21.2.42)        ← 库内部
+   by mysql_real_connect
+   by 0x10C870: db_conn (db.c:162)
+   by db_insert_sensor … proto_handle_data                  （thread #5，工作线程）
+This conflicts with a previous write … by thread #6
+   by db_query … db_run_analysis … analysis_thread           （分析线程）
+Address 0x4f8be40 is in the BSS segment of libmysqlclient.so.21.2.42
+```
+
+**定位**
+两条堆栈的调用方分别是**工作线程**与**分析线程**的**首次**建连（`db_conn()` 里的 `mysql_real_connect`）。S4/S5 只有工作线程，且它们被"第一条 DATA"触发的时刻分散，没撞上；S6 加了分析线程，它在启动后第一次统计时必然建连。
+
+**原因**
+两个线程各自的首次建连之间**没有 happens-before 关系**（它们是兄弟线程；主线程在 `db_init` 里的那次建连只随"创建线程"这个动作建立了同步，管不到兄弟线程彼此）。helgrind 判定的是"无同步关系的两次访问"，不要求时间上真的重叠。竞争位置在 libmysqlclient 自己的 BSS 全局，不是我们的代码——但只要并发走这条库路径，就会被判定为竞争，而它是真实的未同步访问。
+
+**解决**
+给 db.c 的建连路径加一把锁 `g_conn_lock`（`mysql_close` 共用同一把），把"首次建连/关闭"串行化：
+
+- 已有连接的**快路径完全不碰锁**（`if (t_conn != NULL) return t_conn;`），查询/写入性能不受影响；
+- 建连是每个线程**一生一次**的罕见事件，串行化没有实际代价；
+- 锁内不获取任何其它锁，**不引入锁序问题**。
+
+重跑 helgrind（两个客户端并发收发 + 分析线程同时统计推送）：`ERROR SUMMARY: 0 errors from 0 contexts`。
+
+### 问题 37：ANALYSIS 推送的统计值与库里存的值对不上（精度）
+
+**现象**
+首轮推送里出现：
+
+```json
+{"id":1,"avg":24.282609,…,"std":3.8810187113933439,"over_count":9}
+```
+
+而 `analysis_result` 里同一组存的是 `24.28 / 3.88`。
+
+**定位**
+`analysis_result` 的列是 `DECIMAL(10,2)`，入库时被舍到 2 位小数；推送走的是 cJSON 的 double 打印——cJSON 先用 `%1.15g` 尝试，往返不成立就退到 `%1.17g`，于是 `std` 打成 17 位有效数字的长串。
+
+**原因**
+不是缺陷（JSON 数值合法，误差也远小于验收要求的 0.05），但"客户端显示的数字"与"SQL 查出来的数字"不一致，联调时极易被当成 bug；客户端界面上也不好看。
+
+**解决**
+推送前按列精度规整（新增 `analysis_round2()`，舍入方向与 MySQL 的 DECIMAL 一致：远离零）。现在推送值与库值**逐位相同**，客户端的数字与数据库自查结果对得上。
+
+### 问题 38：`ssh "mysql -e \"…\""` 引号嵌套，命令根本没执行
+
+**现象**
+
+```
+$ ssh vmserver-lan "mysql -uiot -piot123456 machine_room -e \"
+SELECT … FROM analysis_result;\""
+/usr/bin/bash: eval: line 4: unexpected EOF while looking for matching `"'
+```
+
+**定位**
+外层双引号（ssh 参数）+ 内层双引号（mysql -e）+ SQL 里的单引号（字符串字面量），三层嵌套把本地 shell 绕晕，远程拿到的是一条截断的命令。
+
+**原因**
+与问题 32 同类：**采集证据的方式本身没验过**。这次 shell 直接报错还算幸运；若它"恰好"执行了一条残缺但合法的查询，就会拿到错误证据而不自知。
+
+**解决**
+SQL 一律走 heredoc，既不碰引号嵌套、也不在命令行暴露密码：
+
+```bash
+ssh vmserver-lan "MYSQL_PWD=iot123456 mysql -uiot machine_room -t" <<'SQL'
+SELECT …;
+SQL
+```
+
+### 问题 39：`grep 'ANALYSIS'` 把脚本自己的汇总行也算进去（假阳性）
+
+**现象**
+S6-3 验收里 `grep 'ANALYSIS' s6d2.txt | tail -1` 打出来的"那条 ANALYSIS"，其实是脚本收尾的汇总行：
+
+```
+=== 汇总：发 DATA 0 条、指定消息 3 条；收到 ANALYSIS 2 条、其它回包 9 条 ===
+```
+
+**定位**
+probe 的汇总行正文里含 "ANALYSIS" 三个字，被 `grep 'ANALYSIS'` 一并匹配，`tail -1` 取到的正是这最后一行。
+
+**原因**
+与问题 21（`grep 'ERROR'` 匹到正文里的"回 ERROR"）**完全同类**：用关键词筛日志时没把"正文里也会出现这个词"算进去。这次还叠加了一个更坏的后果——若我不核对，就会得出"S6-D2 没收到 ANALYSIS"的错误结论（实际收到了 2 条）。
+
+**解决**
+筛报文一律带上 JSON 的引号：`grep '"ANALYSIS"' 文件`。经验沿用问题 21：**用关键词提取证据前，先把"这个词还可能出现在哪里"想一遍**。
+
+---
+
+## 二十一、S6 验收结论
+
+**产出**：新增 `src/analysis.c` / `src/analysis.h`（分析线程：周期统计 + 逐 client 组包推送 ANALYSIS + 可中断的条件变量等待）；改动 `db.c`/`db.h`（`db_run_analysis` 聚合查询与入库、结果内存副本与 `db_analysis_count/row/period` 三个读接口、`db_set_analysis_window`、新增建连锁 `g_conn_lock`）、`session.c`/`session.h`（新增 `session_snapshot_logged`：fd 与 client_id 同锁取齐）、`main.c`（getopt `-p/-t/-w`、创建分析线程、退出时 `analysis_stop` + `pthread_join` 再关库）。`make clean && make` **零警告零错误**。**接口规范 §3.1/§3.2/§4 零改动**（ANALYSIS 字段名与顺序逐字对齐 §3.1）。
+
+**验收命令与实测输出**（同一台服务器；两台客户端脚本为仓库外 `s6_probe.py`，登录后按秒发 DATA 并打印全部回包）
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S6-1 | 默认参数启动 `./server`，再 `python -u s6_probe.py 10.202.57.4 9000 S6-C --data 75`（75s ≥ 一个 60s 周期） | probe 每周期收到一条 ANALYSIS，JSON 字段与 §3.1 逐一对齐 | ✅ 收到 1 条（窗口 19:12:58~19:22:58）：`{"type":"ANALYSIS","period_start":"2026-09-22 19:12:58","period_end":"2026-09-22 19:22:58","sensors":[{"id":1,"avg":24.1,"max":29.3,"min":18.3,"std":3.56,"over_count":8},{"id":2,"avg":56.88,"max":78.6,"min":40.2,"std":11.03,"over_count":8},{"id":3,"avg":300,"max":538,"min":111,"std":123.09,"over_count":5},{"id":4,"avg":456.14,"max":779,"min":140,"std":206.66,"over_count":0}]}` —— 字段名、顺序、类型与 §3.1 示例逐项一致；窗口跨度 600s |
+| S6-2 | `SELECT * FROM analysis_result WHERE client_id='S6-C' AND period_end='2026-09-22 19:22:58';` 与同窗口手工 SQL（`AVG/MAX/MIN/STDDEV_POP` + 阈值 CASE 求和，窗口取该行的 `period_start/period_end`）比对 | 每周期每个 client×sensor 一行；avg/max/min 与手工 SQL 误差 < 0.05 | ✅ 库中 id 133~136 四行：`24.10/29.30/18.30/3.56/8`、`56.88/78.60/40.20/11.03/8`、`300.00/538/111/123.09/5`、`456.14/779/140/206.66/0`；手工 SQL 同窗口得 `24.100000 / 56.881818 / 300.000000 / 456.136364` 与 `std 3.55911122715668 / 11.027842299612555 / 123.08792127433284 / 206.66008442819276`、`over_cnt 8/8/5/0` —— **max/min/over_count 逐位相同，avg/std 最大误差 0.0036 ≪ 0.05**；推送值与库值逐位相同 |
+| S6-3 | `./server -t 15 -w 60`，`S6-D2` 连发 3 条 `{"type":"DATA","sensors":[{"id":1,"v":30.0},{"id":2,"v":70.0},{"id":3,"v":500},{"id":4,"v":600}]}` 后等一个周期 | 该组 over_count = 3 | ✅ 推送 `{"id":1,"avg":30,…,"over_count":3},{"id":2,…,"over_count":3},{"id":3,…,"over_count":3},{"id":4,…,"over_count":0}`（光照不告警恒 0）；库中 id 173~176 的 `over_count` = `3/3/3/0`，与推送一致 |
+| S6-4 | 全部客户端断开后连等多个周期（窗口内旧数据过期后） | 不崩溃；无统计行、不推送（或推空数组，二选一并在运行说明注明） | ✅ 19:25:21 / 19:25:36 / 19:25:51 连续三个周期日志 `分析：窗口 … 内无数据，本周期不写 analysis_result`；`analysis_result` 行数稳定在 **192** 不再增长；服务器进程正常、无任何推送。口径选"**不推送**（不发空 sensors 数组）"，已注明在 `运行说明.md` §5.5 |
+| S6-5 | `./server -t 15 -w 60` | 15 秒即产出统计，窗口为 1 分钟 | ✅ 启动横幅 `分析周期/窗口: 15s / 60s`；客户端连上后 **15.0s / 21.9s** 各收到一条 ANALYSIS；库中 `TIMESTAMPDIFF(SECOND, period_start, period_end)` = **60**；每 15 秒一期（19:23:21 → 19:23:36 → …） |
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| **禁止把 A 的统计发给 B**（任务要求的红线） | ✅ 两个客户端并发：`S6-D1` 发 `20/50/300/500`、`S6-D2` 发 `30/70/500/600`，同一期（19:23:36~19:24:36）各自收到的 sensors 只含自己的值（D1 的 `avg` 全是对应的 20/50/300/500 且 `over_count` 全 0；D2 是 30/70/500/600 且超标组为 3） |
+| **不在线的 client 只入库、不推送** | ✅ 19:24:36 期两个客户端都在线 → 各推 1 条；客户端 19:24:3x 断开后，19:24:51 期日志为 `共 8 组、入库 8 行；当前无在线客户端，不推送` —— 数据进了 `analysis_result`，但没人收推送 |
+| **一期多 client 混合时只推在线的那一个** | ✅ 19:22:58 期窗口内有 5 个 client（HG-6/HG-6B/HG-6C/HG-6D/S6-C）共 **20 组**入库，而只给当时唯一在线的 S6-C 推了 1 条（日志 `在线 1 个客户端，推送 1 个（跳过 0）`） |
+| **单样本 std 给 0 不给 null** | ✅ `S6-D1/D2` 每组只有一个样本，推送与库中 `std` 均为 **0**（`0` 而非 `null`，也不是空值） |
+| **数据竞争检测（helgrind）** | ✅ `valgrind --tool=helgrind ./server -t 20 -w 60` + 两个客户端并发收发 + 分析线程统计推送，优雅退出后 `grep -c 'Possible data race'` = **0**、`ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 8217 from 186)`。过程中修掉两处真实竞争：退出标志（问题 35）、并发首次建连（问题 36） |
+| **getopt 参数校验** | ✅ `-t abc`／`-p 99999`／`-h` 均打印"参数错误…" + 用法并以 `rc=1` 退出，不启动服务器；`-p/-t/-w` 默认值与 `分析周期/窗口` 横幅一致 |
+| **优雅退出回归（S0~S5）** | ✅ SIGINT 后依次打印 `select 主循环已退出` → `分析线程已收到退出请求，退出` → `数据库连接已关闭（mysql_library_end 已调用）` → `收到退出信号，服务器正常退出`；`pgrep -ax server` 无残留、9000 端口释放 |
+| 服务器错误日志 | ✅ 两个实例全程 `grep -c '\[ERROR\]'` = **0** |
+
+---
+
+## 二十二、S6 实现要点（供 S7/S8 参考，避免踩坑）
+
+1. **分析线程用自己那条 MySQL 连接**：db 模块的 `__thread` 惰性建连会在它第一次调 `db_*` 时自动建立，**不要**把主线程的连接对象传过去（S4 要点 2 的老规矩）。
+2. **`g_conn_lock` 只保护"首次建连/关闭"，快路径无锁**：不要为了"省一把锁"删掉它——删掉问题 36 的竞争就复活（helgrind 会报）。也不要把它扩成"保护整个查询"（那会把每线程一条连接的收益全抹掉）。
+3. **退出顺序：`analysis_stop()` → `pthread_join()` → `db_shutdown()`**（main.c 收尾）。分析线程有自己的连接，必须在 `mysql_library_end()` 之前停稳；工作线程没有 join 机制，仍随进程退出（§九 的同一取舍）。
+4. **over_count 与 ALARM 是同一套判定口径**（严格不等号、NULL 侧不检查、无配置不判），但**分别实现**在两处：`alarm.c` 的 C 判定与 `db.c` 的 `db_build_over_expr()` SQL 片段。改判定口径时**两处都要改**；S7 若发现两者不一致，先查这里。
+5. **S6-4 的口径是"无数据不推送"**（不是推空 `sensors` 数组），对外承诺已写进 `运行说明.md` §5.5——客户端（任务B）不需要处理空数组。
+6. **推送前复核 fd 归属**（`session_client_id_copy` 再比一次）：快照到推送之间 fd 可能被回收复用，这是"不把 A 的统计发给 B"的最后一道闸，别当成冗余代码删掉。
+7. **valgrind 的启停姿势**：进程名是 `helgrind-amd64-`，用 `pgrep -f '[v]algrind.bin'` 取 PID 再 `kill -INT`，否则会像问题 34 那样"杀掉了一个不存在的进程"还浑然不觉。
+8. **筛证据带引号**：报文用 `grep '"ANALYSIS"'`，日志级别用 `grep '\[ERROR\]'`（问题 21/39 是同一类假阳性）。
+9. 本步的 getopt 只在启动时解析一次、之后参数只读，因此 `analysis_cfg_t` 可以直接指向 main 的栈变量：`pthread_create` 建立 happens-before，分析线程读到的一定是初始化好的值（与阈值缓存同一套理由）。

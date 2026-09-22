@@ -1,5 +1,6 @@
 /*
- * db.c —— MySQL 连接与写入封装（S4：DATA 入库；S5：阈值加载 + 告警入库）
+ * db.c —— MySQL 连接与写入封装（S4：DATA 入库；S5：阈值加载 + 告警入库；
+ *         S6：周期统计 db_run_analysis）
  *
  * 本文件是**唯一**包含 <mysql/mysql.h> 的地方（规划 §2.2 铁律 1），
  * 表结构与字段严格按 `docs/接口规范.md` §4，不增删字段。
@@ -17,9 +18,11 @@
  * 本模块跑在工作线程里 —— 与 proto 一样，只做"锁外"的事：不碰会话表内部结构、
  * 不调用 net_close（关连接只归主线程，调试记录 §十三 要点 1）。
  */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <mysql/mysql.h>
 
@@ -50,6 +53,17 @@ static int  g_ready      = 0;       /* 0 = 尚未 db_init */
 /* 每线程一条连接。__thread 让 4 个工作线程各持一份，互不干扰；
  * 每份只在**本线程**内被读写，故无需任何锁保护。 */
 static __thread MYSQL *t_conn = NULL;
+
+/* 建连锁：只保护"首次建立连接"这一段，查询/写入路径完全不碰它。
+ *
+ * 为什么需要它：libmysqlclient 的 mysql_real_connect 首次调用路径会写它自己
+ * BSS 段里的全局状态（helgrind 实测：两个线程并发首次建连时报数据竞争，
+ * 堆栈从 mysql_real_connect 一路到库内部）。S4/S5 只有工作线程、且它们是在
+ * 不同时刻被第一条 DATA 触发的，没撞上；S6 有了分析线程，它与工作线程的
+ * 首次建连会同时发生（服务器启动 60 秒后第一次统计，客户端也正在发数据）。
+ * 建连是每个线程**一生一次**的罕见事件，串行化它没有任何性能代价，
+ * 也不需要担心锁序（本锁内不获取任何其它锁）。 */
+static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 阈值缓存（S5）：threshold_cfg 的只读副本，下标 = sensor_type（1~4）。
  * 由 db_load_thresholds() 在**主线程、pool_init 之前**填好，此后不再改动，
@@ -132,24 +146,27 @@ static MYSQL *db_conn(void)
     unsigned int tmo = DB_CONN_TIMEOUT_SEC;
 
     if (t_conn != NULL) {
-        return t_conn;
+        return t_conn;                  /* 快路径：本线程已建好连接，全程无锁 */
     }
     if (!g_ready) {
         log_err("数据库尚未初始化（db_init 未成功），本条数据未写入");
         return NULL;
     }
 
+    /* 慢路径 = 本线程第一次碰库：串行建连（理由见 g_conn_lock 的说明） */
+    pthread_mutex_lock(&g_conn_lock);
+
     /* 每个线程首次接触 MySQL 前必须初始化线程局部环境，否则 mysql_init /
      * 查询里会碰未初始化的线程数据（规划 S4 任务 1）。 */
     if (mysql_thread_init() != 0) {
         log_err("mysql_thread_init() 失败，本线程无法建库连接");
-        return NULL;
+        goto out;
     }
 
     t_conn = mysql_init(NULL);
     if (t_conn == NULL) {
         log_err("mysql_init() 失败（内存不足），本线程无法建库连接");
-        return NULL;
+        goto out;
     }
 
     /* 字符集与库一致（接口规范 §4：utf8mb4）；建连超时避免数据库没起时
@@ -163,21 +180,32 @@ static MYSQL *db_conn(void)
                 mysql_error(t_conn), g_user, g_host, g_dbname);
         mysql_close(t_conn);
         t_conn = NULL;
-        return NULL;
+        goto out;
     }
 
     log_info("本线程已建立 MySQL 连接（每线程一条，%s@%s/%s）",
              g_user, g_host, g_dbname);
+
+out:
+    pthread_mutex_unlock(&g_conn_lock);
     return t_conn;
 }
 
-/* 丢弃本线程的连接（下次 db_conn 会重建） */
+/* 丢弃本线程的连接（下次 db_conn 会重建）。
+ * 与建连共用同一把锁：mysql_close 同样会碰库的全局状态，而它可能发生在
+ * 另一个线程正在建连的时候（重连路径 + 启动期的分析线程）。 */
 static void db_conn_drop(void)
 {
+    if (t_conn == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_conn_lock);
     if (t_conn != NULL) {
         mysql_close(t_conn);
         t_conn = NULL;
     }
+    pthread_mutex_unlock(&g_conn_lock);
 }
 
 /*
@@ -476,6 +504,269 @@ int db_threshold_get(int sensor_type, db_threshold_t *out)
 
     *out = g_thr[sensor_type].t;
     return 0;
+}
+
+/*
+ * ---- S6：周期统计（分析线程调用） ----
+ */
+
+/* 结果缓存的容量：最坏情况每个在线 client × 每个传感器各一组。
+ * 超过就截断并告警（正常规模 3~5 个 client 远够用）。 */
+#define DB_ANALYSIS_MAX_ROWS  (MAX_SESSIONS * SENSOR_ID_MAX)
+#define DB_ANALYSIS_TIME_LEN  32     /* "YYYY-MM-DD HH:MM:SS" + 余量 */
+
+static int               g_window_sec = ANALYSIS_WINDOW_SEC;  /* getopt -w 可改 */
+static char              g_period_start[DB_ANALYSIS_TIME_LEN];
+static char              g_period_end[DB_ANALYSIS_TIME_LEN];
+static db_analysis_row_t g_ana[DB_ANALYSIS_MAX_ROWS];
+static int               g_ana_n = 0;
+
+/* time_t → "%Y-%m-%d %H:%M:%S"（与接口规范 §3.2 的时间格式一致，整秒） */
+static void db_fmt_time(time_t t, char *out, size_t cap)
+{
+    struct tm tmv;
+
+    localtime_r(&t, &tmv);
+    if (strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tmv) == 0) {
+        out[0] = '\0';              /* 缓冲太小（不会发生），退化成空串 */
+    }
+}
+
+/*
+ * 拼 over_count 的 SQL 片段：SUM(CASE WHEN <超限条件> THEN 1 ELSE 0 END)。
+ * 条件由内存里的阈值缓存生成，与 alarm_check 的判定逐条对应：
+ *   - 超上限用严格 '>' 、低于下限用严格 '<'（等于边界不算超标，S5 口径）；
+ *   - min/max 在表里为 NULL 的一侧不生成条件（如烟雾没有下限）；
+ *   - 没有配置行的传感器（光照）不参与，其 over_count 恒 0；
+ *   - 整张表都没有可判定的传感器时退化成字面量 0。
+ * 这就是规划 S6 任务 2 所说的"结合内存阈值计算"：只查一次库，不额外拉行。
+ * 缓冲不够返回 -1（调用方跳过本周期，不会执行半截 SQL）。
+ */
+static int db_build_over_expr(char *buf, size_t cap)
+{
+    size_t used  = 0;
+    int    first = 1;
+    int    st;
+    int    n;
+    char   cond[512];
+
+    for (st = SENSOR_ID_MIN; st <= SENSOR_ID_MAX; st++) {
+        const db_thr_slot_t *slot = &g_thr[st];
+        size_t cused;
+
+        if (!slot->valid || (!slot->t.has_max && !slot->t.has_min)) {
+            continue;               /* 不告警的传感器不产生超限判定 */
+        }
+
+        n = snprintf(cond, sizeof(cond), "(sensor_type = %d AND (", st);
+        if (n < 0 || (size_t)n >= sizeof(cond)) {
+            return -1;
+        }
+        cused = (size_t)n;
+
+        if (slot->t.has_max) {
+            n = snprintf(cond + cused, sizeof(cond) - cused,
+                         "sensor_value > %.2f", slot->t.max_value);
+            if (n < 0 || (size_t)n >= sizeof(cond) - cused) {
+                return -1;
+            }
+            cused += (size_t)n;
+        }
+        if (slot->t.has_min) {
+            n = snprintf(cond + cused, sizeof(cond) - cused,
+                         "%ssensor_value < %.2f",
+                         slot->t.has_max ? " OR " : "", slot->t.min_value);
+            if (n < 0 || (size_t)n >= sizeof(cond) - cused) {
+                return -1;
+            }
+            cused += (size_t)n;
+        }
+
+        n = snprintf(cond + cused, sizeof(cond) - cused, "))");
+        if (n < 0 || (size_t)n >= sizeof(cond) - cused) {
+            return -1;
+        }
+
+        if (first) {
+            n = snprintf(buf, cap, "SUM(CASE WHEN %s", cond);
+        } else {
+            n = snprintf(buf + used, cap - used, " OR %s", cond);
+        }
+        if (n < 0 || (size_t)n >= cap - used) {
+            return -1;
+        }
+        used += (size_t)n;
+        first = 0;
+    }
+
+    if (first) {                    /* 没有任何阈值配置：over_count 恒 0 */
+        n = snprintf(buf, cap, "0");
+        return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+    }
+
+    n = snprintf(buf + used, cap - used, " THEN 1 ELSE 0 END)");
+    return (n < 0 || (size_t)n >= cap - used) ? -1 : 0;
+}
+
+int db_set_analysis_window(int sec)
+{
+    if (sec < 1) {
+        log_warn("统计窗口 %d 秒非法（须 >= 1），改用默认 %d 秒",
+                 sec, ANALYSIS_WINDOW_SEC);
+        g_window_sec = ANALYSIS_WINDOW_SEC;
+    } else {
+        g_window_sec = sec;
+    }
+    return g_window_sec;
+}
+
+int db_run_analysis(void)
+{
+    MYSQL_RES *res = NULL;
+    MYSQL_ROW  row;
+    MYSQL     *c;
+    char       over_expr[768];
+    char       sql[4096];
+    char       esc_id[CLIENT_ID_MAX_LEN * 2 + 1];
+    time_t     now;
+    int        n;
+    int        i;
+    int        written   = 0;
+    int        truncated = 0;
+
+    g_ana_n           = 0;
+    g_period_start[0] = '\0';
+    g_period_end[0]   = '\0';
+
+    /* 窗口右端点 = 服务器当前时刻（整秒）。把这两个字符串**同时**用作 SQL 的
+     * WHERE 字面量与推送里的 period_start/period_end——推送口径与实际统计口径
+     * 因此逐字节一致，S6-2 的手工比对可以原样复现同一窗口。 */
+    now = time(NULL);
+    db_fmt_time(now - (time_t)g_window_sec, g_period_start, sizeof(g_period_start));
+    db_fmt_time(now,                        g_period_end,   sizeof(g_period_end));
+
+    if (db_build_over_expr(over_expr, sizeof(over_expr)) < 0) {
+        log_err("分析：超限统计表达式生成失败（阈值配置异常），本周期跳过");
+        return 0;
+    }
+
+    n = snprintf(sql, sizeof(sql),
+                 "SELECT client_id, sensor_type, "
+                 "AVG(sensor_value), MAX(sensor_value), MIN(sensor_value), "
+                 "STDDEV_POP(sensor_value), %s "
+                 "FROM sensor_data "
+                 "WHERE collect_time >= '%s' AND collect_time <= '%s' "
+                 "GROUP BY client_id, sensor_type "
+                 "ORDER BY client_id, sensor_type",
+                 over_expr, g_period_start, g_period_end);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        log_err("分析：聚合 SQL 超长（>%u 字节），本周期跳过", (unsigned)sizeof(sql) - 1);
+        return 0;
+    }
+
+    if (db_query(sql, &res) < 0) {
+        return 0;                   /* db_query 已记日志 */
+    }
+
+    while ((row = mysql_fetch_row(res)) != NULL) {
+        db_analysis_row_t *r;
+
+        if (g_ana_n >= DB_ANALYSIS_MAX_ROWS) {
+            truncated = 1;
+            break;
+        }
+        if (row[0] == NULL) {
+            continue;               /* client_id 是 NOT NULL 列，这里只是防御 */
+        }
+
+        r = &g_ana[g_ana_n];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->client_id, sizeof(r->client_id), "%s", row[0]);
+        r->sensor_type = (row[1] != NULL) ? atoi(row[1]) : 0;
+
+        /* DECIMAL/DOUBLE 从 MySQL 取回来都是**字符串**，用 strtod 转换；
+         * NULL 一律按 0 处理——STDDEV_POP 对"窗口内只有一个样本"的组在某些
+         * 情况下会给出 NULL，接口规范 §3.1 的 std 字段必须给数值 0 而非 null
+         * （规划 S6 常见坑）。 */
+        r->avg_value  = (row[2] != NULL) ? strtod(row[2], NULL) : 0.0;
+        r->max_value  = (row[3] != NULL) ? strtod(row[3], NULL) : 0.0;
+        r->min_value  = (row[4] != NULL) ? strtod(row[4], NULL) : 0.0;
+        r->std_value  = (row[5] != NULL) ? strtod(row[5], NULL) : 0.0;
+        r->over_count = (row[6] != NULL) ? atoi(row[6]) : 0;
+
+        g_ana_n++;
+    }
+    mysql_free_result(res);
+
+    if (truncated) {
+        log_warn("分析：统计组数超过上限 %d，多余的组已丢弃（请检查在线客户端数量）",
+                 DB_ANALYSIS_MAX_ROWS);
+    }
+
+    if (g_ana_n == 0) {
+        log_info("分析：窗口 %s ~ %s 内无数据，本周期不写 analysis_result",
+                 g_period_start, g_period_end);
+        return 0;
+    }
+
+    /* 逐组写 analysis_result（字段与接口规范 §4 逐列对应）。
+     * 这里复用 db_exec，同样带"断线重连一次"的兜底。 */
+    c = db_conn();
+    if (c == NULL) {
+        return 0;                   /* db_conn 已记日志：统计结果留在内存里，
+                                     * 本周期不写库，推送仍可继续（见 analysis.c） */
+    }
+
+    for (i = 0; i < g_ana_n; i++) {
+        const db_analysis_row_t *r = &g_ana[i];
+
+        mysql_real_escape_string(c, esc_id, r->client_id,
+                                 (unsigned long)strlen(r->client_id));
+
+        n = snprintf(sql, sizeof(sql),
+                     "INSERT INTO analysis_result"
+                     "(client_id, sensor_type, period_start, period_end, "
+                     "avg_value, max_value, min_value, std_value, over_count, created_time) "
+                     "VALUES ('%s', %d, '%s', '%s', %.2f, %.2f, %.2f, %.2f, %d, NOW())",
+                     esc_id, r->sensor_type, g_period_start, g_period_end,
+                     r->avg_value, r->max_value, r->min_value, r->std_value,
+                     r->over_count);
+        if (n < 0 || (size_t)n >= sizeof(sql)) {
+            log_err("分析：INSERT 语句超长（>%u 字节），client_id=%s sensor=%d 未写入",
+                    (unsigned)sizeof(sql) - 1, r->client_id, r->sensor_type);
+            continue;
+        }
+        if (db_exec(sql) == 0) {
+            written++;
+        }
+    }
+
+    log_info("分析：窗口 %s ~ %s 统计出 %d 组，写入 analysis_result %d 行",
+             g_period_start, g_period_end, g_ana_n, written);
+    return written;
+}
+
+void db_analysis_period(char *start_out, size_t scap, char *end_out, size_t ecap)
+{
+    if (start_out != NULL && scap > 0) {
+        snprintf(start_out, scap, "%s", g_period_start);
+    }
+    if (end_out != NULL && ecap > 0) {
+        snprintf(end_out, ecap, "%s", g_period_end);
+    }
+}
+
+int db_analysis_count(void)
+{
+    return g_ana_n;
+}
+
+const db_analysis_row_t *db_analysis_row(int idx)
+{
+    if (idx < 0 || idx >= g_ana_n) {
+        return NULL;
+    }
+    return &g_ana[idx];
 }
 
 void db_shutdown(void)

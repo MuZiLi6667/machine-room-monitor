@@ -14,6 +14,8 @@
 #ifndef DB_H
 #define DB_H
 
+#include <stddef.h>         /* size_t：db_analysis_period 的缓冲长度参数 */
+
 #define DB_LEVEL_LEN 9      /* threshold_cfg.level VARCHAR(8) + 结尾 '\0' */
 
 /* 一个传感器的阈值配置（threshold_cfg 一行的只读副本）。
@@ -67,7 +69,47 @@ int db_load_thresholds(void);
  * 判"这型传感器不告警"（光照在 threshold_cfg 里不插行）。S5 起由 alarm.c 使用。 */
 int db_threshold_get(int sensor_type, db_threshold_t *out);
 
-/* 聚合近 10 分钟 → 写 analysis_result，返回生成行数；S6 实现 */
-int db_run_analysis(void);
+/* ---- S6：周期统计 ---- */
+
+/* 一条分析结果 = analysis_result 一行的只读副本（字段与接口规范 §4 同名）。
+ * std_value 对"窗口内只有一个样本"或"所有样本相同"的组为 0（不是 NULL）；
+ * over_count 是窗口内该组超过阈值的数据条数（与 ALARM 同一判定口径）。 */
+typedef struct {
+    char   client_id[CLIENT_ID_MAX_LEN + 1];
+    int    sensor_type;
+    double avg_value;
+    double max_value;
+    double min_value;
+    double std_value;
+    int    over_count;
+} db_analysis_row_t;
+
+/* 设置统计窗口秒数（main 解析 getopt -w 后调用；不调用则用
+ * config.h 的 ANALYSIS_WINDOW_SEC）。参数 <1 时回退到默认值。
+ * 必须在分析线程启动前调用（靠 pthread_create 建立 happens-before）。
+ * 返回实际生效的窗口秒数。 */
+int db_set_analysis_window(int sec);
+
+/* 聚合"最近 window 秒"的 sensor_data → 逐组写 analysis_result，返回**写入
+ * 的行数**（0 = 窗口内无数据，此时不写库）。由分析线程每周期调用一次。
+ *
+ * 查询走 db_query()（带结果集的 SELECT + 断线重连一次）；窗口两端点取自
+ * 本函数执行时的服务器时间，并原样作为 period_start/period_end 与 SQL 的
+ * WHERE 字面量——推送里的窗口与实际统计的窗口因此逐字节一致。
+ * over_count 的判定阈值来自 db_threshold_get() 的内存缓存（与 alarm.c 同源同
+ * 口径：严格不等号、NULL 侧不检查、无配置不判），不另查一次库。
+ *
+ * 统计结果同时留在本模块内部缓存里，供 analysis.c 组包推送（见下面两个
+ * getter）——分析线程自己写、自己读，故无需加锁。 */
+int  db_run_analysis(void);
+
+/* 取最近一次 db_run_analysis 的窗口（ANALYSIS 的 period_start / period_end）。 */
+void db_analysis_period(char *start_out, size_t scap, char *end_out, size_t ecap);
+
+/* 最近一次 db_run_analysis 统计出的组数 / 第 idx 组（越界返回 NULL）。
+ * 返回的是 db.c 内部缓存的指针，**只允许分析线程访问**（写者与读者都是它，
+ * 下一次 db_run_analysis 会原地覆盖）。 */
+int  db_analysis_count(void);
+const db_analysis_row_t *db_analysis_row(int idx);
 
 #endif /* DB_H */
