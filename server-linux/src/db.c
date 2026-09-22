@@ -769,6 +769,13 @@ const db_analysis_row_t *db_analysis_row(int idx)
     return &g_ana[idx];
 }
 
+void db_close_this_thread(void)
+{
+    /* 转发给 static 的 db_conn_drop 即可：它关的本来就是"调用线程"的
+     * t_conn。连接不存在时是空操作（分析线程整轮没建过连也能安全调用）。 */
+    db_conn_drop();
+}
+
 void db_shutdown(void)
 {
     db_conn_drop();                 /* 主线程这条 */

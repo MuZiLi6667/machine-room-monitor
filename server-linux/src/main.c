@@ -1,5 +1,5 @@
 /*
- * main.c —— 程序入口（S6 版本：DATA 入库 + 阈值告警 + 周期统计/ANALYSIS 推送）
+ * main.c —— 程序入口（S8 交付版：会话协议 + DATA 入库 + 阈值告警 + 周期统计）
  *
  * 本文件是"组装者"：唯一知道所有模块的文件（规划 §2.2）。
  * 启动顺序：参数解析 → 日志 → 数据库 → 阈值加载 → 线程池 → 网络监听 →
@@ -117,7 +117,7 @@ int main(int argc, char **argv)
     /* 2. 启动信息 */
     log_info("==================================================");
     log_info("机房环境多指标远程监测与分析系统 —— 服务器端");
-    log_info("版本 S6：周期统计 + ANALYSIS 推送（analysis_result 入库）");
+    log_info("版本 S8 交付版：LOGIN/心跳/超时 + DATA 入库 + 阈值告警 + 周期统计");
     log_info("监听端口   : %d", port);
     log_info("工作线程   : %d 个（任务队列 %d）", POOL_THREADS, POOL_QUEUE_SIZE);
     log_info("心跳/超时  : %ds / %ds", HEARTBEAT_INTERVAL_SEC, SESSION_TIMEOUT_SEC);

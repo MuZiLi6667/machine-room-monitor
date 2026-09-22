@@ -49,6 +49,17 @@ int db_insert_sensor(const char *client_id, int sensor_type,
  * 机制，见调试记录 §九 的说明）。 */
 void db_shutdown(void);
 
+/* 关闭**本线程**的 MySQL 连接（S8 新增，修调试记录问题 40）。
+ *
+ * 专供"会真正退出的线程"在自己退出前调用：连接存在线程局部 __thread 里，
+ * 线程一退出 TLS 就销毁，主线程再也拿不到那个指针——连接若不先关掉，就成了
+ * 没人指向的内存（memcheck 报 definitely lost）。分析线程被 pthread_join 真
+ * 回收，属于这一类。
+ *
+ * **常驻工作线程不要调**（它们没有退出路径，连接随进程退出回收）；
+ * 调用后若本线程还要写库，db_* 会自动重建连接，无需额外处理。 */
+void db_close_this_thread(void);
+
 /* 写一行告警（alarm_log 表，S5 实现）。
  *   client_id   ：内部转义防注入
  *   sensor_type ：1~4，越界返回 -1

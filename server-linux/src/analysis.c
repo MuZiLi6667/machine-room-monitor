@@ -268,6 +268,12 @@ void *analysis_thread(void *arg)
         analysis_once();
     }
 
+    /* 退出前关掉本线程那条 MySQL 连接（S8 修调试记录问题 40）：本线程是被
+     * pthread_join 真回收的，TLS 随线程销毁，连接不先关就成了没指针指向的
+     * 内存（memcheck 报 definitely lost 1,192 + indirectly lost 27,786 字节）。
+     * 工作线程没有退出路径，不在此列——别把这一句"搬"到别处去。 */
+    db_close_this_thread();
+
     log_info("分析线程已收到退出请求，退出");
     return NULL;
 }

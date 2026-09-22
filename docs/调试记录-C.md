@@ -1373,7 +1373,41 @@ S6 给分析线程加了优雅退出（`analysis_stop()` → `pthread_join()`，
 
 **影响面**：**运行期不累积**。分析线程只建一条连接（`db_conn()` 的快路径命中后不再新建），泄漏发生在它退出、进程即将结束的时刻。所以这不是"跑久了耗尽内存"，而是"退出时没释放干净"；但交付口径要求 `definitely lost` 为 0，必须修。
 
-**解决（本次未实施——S7 按约定禁止改业务代码，此处只给出方案）**
+**解决（S7 定方案 → S8 实施并复测归零）**
+
+必须在本线程自己的退出路径上关（`tls_conn` 是线程局部的，线程一退出主线程就再也拿不到它了，放在 `db_shutdown()` 里够不着）：
+
+1. db.h **新增**一个公开接口，例如 `void db_close_this_thread(void);`，实现就是现有 static 函数 `db_conn_drop()` 的直接转发；
+2. `analysis_thread()` 在 `log_info("分析线程已收到退出请求，退出")` **之前**调用它一次；
+3. 属"新增接口"而非改动冻结签名，与 S5 的 `db_threshold_get()`、S6 的 `db_analysis_*()` 同一套路（§2.3 的接口一字不动）。
+
+> S7 当时按"测试步不改业务代码"的约定**只写了方案没实施**。S8 收尾已按上面三步落地，**共 3 处改动、不动任何冻结签名**：
+> `db.h` 加一处声明、`db.c` 加 6 行转发函数、`analysis.c` 在退出日志前加一次调用（含注释说明为什么不能把这一句挪到别处）。
+
+**S8 复测（默认参数完整功能一轮，2026年09月22日 20:28）**
+
+同一台服务器、同一条命令，只是这次跑的是修复后的二进制；一轮里走完 登录/DATA/告警/心跳/非法JSON 并跨过一个分析周期（60s）后 `Ctrl-C` 优雅退出：
+
+```bash
+VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind \
+  /tmp/vg/usr/bin/valgrind --tool=memcheck --leak-check=full --log-file=/tmp/mc8final.log ./server
+# 另一侧：PC-02 发协议向量、PC-01 连发 75 秒 DATA（跨过 20:28:54 的分析周期）
+$ grep -A 6 'LEAK SUMMARY' /tmp/mc8final.log
+==7128==    definitely lost: 0 bytes in 0 blocks          ← 归零（修复前 1,192 bytes in 1 blocks）
+==7128==    indirectly lost: 0 bytes in 0 blocks          ← 归零（修复前 27,786 bytes in 21 blocks）
+==7128==      possibly lost: 117,192 bytes in 92 blocks   ← 与修复前、与对照实验均逐字节相同
+==7128==    still reachable: 0 bytes in 0 blocks
+$ grep -c 'Invalid read\|Invalid write\|uninitialised\|Invalid free' /tmp/mc8final.log
+0
+$ grep -c 'analysis_thread' /tmp/mc8final.log
+0                              # 45 条 loss record 降到 23 条，分析线程一条不剩
+```
+
+把 23 条 loss record 的用户代码帧归类，**全部**落在 4 个常驻工作线程上：
+`proto_handle_data → db_insert_sensor → db_conn → mysql_*`（各写着 "in 4 blocks"）与 `pthread_create → pool_init → main`（TLS）。
+
+> `possibly lost` 仍会是 117,192 字节（4 个常驻工作线程的 TLS + 连接），**那是判读口径内的正常形态，不要试图消除**（要消除就得给线程池加 shutdown/join，属规划未要求的复杂度）。
+> 这句判读口径已同时写进 `运行说明.md` §6，避免后续接手的人把它当成新问题。
 
 必须在**分析线程自己**的退出路径上关（`tls_conn` 是线程局部的，线程一退出主线程就再也拿不到它了，放在 `db_shutdown()` 里够不着）：
 
@@ -1537,3 +1571,157 @@ SELECT id, client_id, sensor_value, collect_time FROM sensor_data WHERE client_i
 5. **"半行残留"类判据别用回包码**：`25.5}]}` 这种"合法 JSON 值 + 尾部垃圾"会被 `cJSON_Parse` 解析成功（不要求整行消费完），走 code=2 而非 code=1（问题 42）。**决定性证据是服务端日志里打印的原始行文本**（`[工作线程] 解析消息：…`）。
 6. **启动/停止服务器只发一条命令并加 `timeout`**：本次两条启动命令串行排队，第一条 ssh 挂到旧实例退出才返回，第二条随即补位把服务器又拉了起来（问题 41）。停服后必须复核 `pgrep -ax server` 为空**且** `ss -ltn | grep 9000` 无监听。
 7. **S7 新增的临时工具都不入库**：`s7_probe.py`（宿主机工作区根目录，仓库外）。仓库内仍只有 S0~S6 的交付物。
+
+---
+
+## 二十六、S8 阶段问题记录（交付收尾）
+
+### 问题 43：上一阶段残留的 server 实例占着 9000，开工第一步应当是"先看端口"
+
+**现象**
+
+S8 准备跑 memcheck，`ss -ltn | grep 9000` 却显示端口已被占用：
+
+```
+$ pgrep -ax server
+5701 ./server
+$ ss -ltn | grep 9000
+LISTEN  0  64  0.0.0.0:9000  0.0.0.0:*
+```
+
+而本轮只启动过虚拟机、改代码、重编译，**没有起过服务器**；`/tmp/s7-server.log` 显示 S7 那个实例（当时 pid 2581）昨晚 20:03:57 已经优雅退出。
+
+**定位**
+
+```bash
+$ ps -o pid,ppid,lstart,cmd -p 5701
+    PID    PPID                  STARTED CMD
+   5701    5700 Tue Sep 22 20:10:21 2026 ./server          # 起于 S7 收尾之后
+$ ps -o pid,lstart,cmd -p 5700
+   5700 Tue Sep 22 20:10:21 2026 bash -c cd ~/server-linux && setsid nohup ./server > /tmp/server.log 2>&1 < /dev/null &
+```
+
+日志 `/tmp/server.log` 里每小时一条「窗口 … 内无数据」，说明它在**空转**——没有任何客户端连它。它是上一阶段收尾时（S7 验收之后、`/clear` 之前）启动的后台实例。
+
+**原因**
+
+后台实例用 `setsid nohup` 起，**脱离 ssh 会话后独立存活**；上一阶段结束时只停了"当时那一个" pid，20:10 又起的这一个没人收。与问题 41 是同一族：**服务器的生命周期不随"发起它的那条 ssh"结束**，所以每次开工/收工都要按端口和进程名复核，而不是凭"我记得停过了"。
+
+**解决**
+
+1. 停掉它（本轮执行 Agent 的权限策略不允许终止非本会话创建的进程，向用户确认后执行）：
+
+```bash
+$ pkill -INT -x server      # 优雅退出；确认：
+$ pgrep -ax server          # 无输出
+$ ss -ltn | grep 9000       # 无输出
+$ tail -1 /tmp/server.log
+[2026-09-22 20:24:22] [INFO ] [server] [tid:139872771889024] 收到退出信号，服务器正常退出
+```
+
+2. **把"先看端口"写进开工自检**：`pgrep -ax server` + `ss -ltn | grep 9000` 两问，任何一条非空就先处理掉再开工——否则后面所有验收都可能是在对着"上一轮的进程"做（就像问题 41 的"补位实例"）。
+
+---
+
+### 问题 44：`| head -N` 让假客户端提前 SIGPIPE 退出，拿到"只压了 16 秒"的半截证据
+
+**现象**
+
+按 `运行说明.md` 走自测时，为了截图只取前几行，命令写成了带管道的形式：
+
+```bash
+ssh vmserver-lan 'timeout 40 python3 -u /tmp/server_probe.py client -H 127.0.0.1 --id PC-01 | head -16'
+```
+
+输出看起来完全正常（登录成功 + 若干条 DATA + 实时 ALARM），但随后查库对不上：
+
+```
+PC-01  sensor_type=1..4  各 8 行      ← 8 条 DATA × 4 传感器
+```
+
+`timeout 40` 意味着 40 秒、每 2 秒一条，应当有约 20 条 DATA、80 行，**少了六成**。
+
+**定位**
+
+probe 打印的序号停在 `[-> #8]`（对应时间戳 20:31:31，距启动仅 14 秒）；服务器日志里也只有这 8 条入库记录——**两边一致，说明是客户端停了，不是服务器丢数据**。
+
+**原因**
+
+`head -16` 读满 16 行就关闭管道退出，此后 probe 的 `print` 撞上 EPIPE，**Python 默认收到 SIGPIPE 直接终止**（不是抛异常）。于是"压 40 秒"变成了"压到第 16 行输出为止"。
+
+与问题 28（验收脚本每轮等满超时）、问题 30（重定向后块缓冲吞掉输出）同一族：**证据管道本身会改变被测对象的行为**。
+
+**解决**
+
+- 抓证据**先落文件再筛**：`python3 -u probe.py … > /tmp/probe.txt 2>&1`，之后随便 `head`/`grep` 那个文件，都不影响已经跑完的进程；
+- 必须在管道里截断时，用 `head -n N` 前先确认"N 大于预期总行数"，或改用 `sed -n '1,Np'` 之类**读完再截**的写法；
+- 判读时**两边对账**（客户端打印的条数 vs 服务器日志/数据库行数）——本次正是靠这个对账才发现少了六成，否则会把半截输出当成"自测通过"。
+
+---
+
+### 观察（非问题）：以 `iot` 身份重导 `init.sql` 会在第 69 行中止
+
+S8 的"从零复现"用 `iot` 账号删库重导（`iot` 的授权含 `machine_room.*` 的 DROP/CREATE，删库重建不需要管理员）：
+
+```bash
+$ mysql -uiot -piot123456 -e "DROP DATABASE machine_room;"
+$ mysql -uiot -piot123456 < sql/init.sql
+ERROR 1227 (42000) at line 69: Access denied; you need (at least one of) the CREATE USER privilege(s) for this operation
+```
+
+**这不是缺陷**：脚本第 4 段（建用户 + 授权）本就需要管理员权限，而 `iot` 用户**早已存在**、不需要重建；中止时前 3 段（建库/建表/阈值）已全部执行完（`SHOW TABLES` 4 张、`threshold_cfg` 3 行齐全）。
+"新机器上首次初始化"仍按文档用 `sudo mysql < sql/init.sql` 一次执行完整脚本。这条边界已写进 `运行说明.md` §2，避免接手的人以为脚本坏了。
+
+---
+
+## 二十七、S8 验收结论
+
+**产出**：交付物齐套（`Makefile` / `sql/init.sql` / `src/` 10 个模块 / `运行说明.md`）。代码改动只有 4 处、共 28 行——
+`db.h` 新增声明、`db.c` 新增 6 行转发函数、`analysis.c` 退出路径加一次调用（问题 40 的修复），外加 `main.c` 两处**纯文案**（启动横幅的版本号由 S6 改成 S8 交付版）。
+**`src/cJSON.c` 未被整份覆盖**（`git diff` 对它为空，S2 的 `__thread` 补丁原样保留），**接口规范 §3.1/§3.2/§3.3/§4 零改动**。
+
+| # | 检查 | 命令 | 实际 |
+|---|---|---|---|
+| S8-1 | 零警告编译 | `cd ~/server-linux && make clean && make` | ✅ `make 退出码=0`、警告/错误行数 **0**，产出 `./server` |
+| S8-2 | **问题 40 修复复测**（默认参数 memcheck） | `VALGRIND_LIB=… valgrind --tool=memcheck --leak-check=full --log-file=/tmp/mc8final.log ./server` + 走完一轮收发/告警/分析后 `Ctrl-C` | ✅ `definitely lost: 0`、`indirectly lost: 0`（修复前 1,192 + 27,786）；`possibly lost: 117,192 bytes in 92 blocks` 与修复前**逐字节相同**；`Invalid read/write/uninitialised` = **0**；23 条 loss record 全在 4 个常驻工作线程，`analysis_thread` 一条不剩 |
+| S8-3 | **只按 `运行说明.md` 从零复现** | ① `mysql -uiot -piot123456 -e "DROP DATABASE machine_room;"`<br>② `mysql -uiot -piot123456 < sql/init.sql`<br>③ `make clean && make`<br>④ `cd ~/server-linux && setsid nohup ./server > /tmp/s8run.log 2>&1 &`<br>⑤ `python3 /tmp/server_probe.py client -H 127.0.0.1 --id PC-01` | ✅ ① `SHOW DATABASES` 只剩 `information_schema/performance_schema`；② 库/表/阈值三段重建完成（第 4 段建用户因无 sudo 权限在第 69 行中止，**属预期**，见 §二十六 观察）；③ `SHOW TABLES` **4 张**、`threshold_cfg` **3 行**；④ 零警告、`监听 socket 就绪：0.0.0.0:9000（fd=4, backlog=64）`；⑤ `LOGIN_ACK` → 每 2 秒一条 DATA → 超阈值**立刻**收到 ALARM。库里 `PC-01` **32 行**（8 条 DATA × 4 传感器）、`alarm_log` **7 行**；20:32:04 的分析周期：`统计出 16 组、写入 analysis_result 16 行`、`在线 3 个客户端，推送 3 个` |
+| S8-4 | **三客户端并发长跑 25 分钟**（`-t/-w` 用默认 60/600） | 3 个 probe `PC-21/22/23` 各 `--data 1500`（每 2s 一条） | ✅ 每个 probe `发 DATA 750 条`（1500÷2）、`收 ANALYSIS 25 条`（1500÷60）、ALARM 951 条，**校验无异常、无崩溃**；库中三 client **各 3000 行**（750×4）、类型各 4 种；服务器 `[ERROR]` 计数 **0** |
+| | 期间 fd / lsof / RSS 三次采样 | `ls /proc/$(pgrep -x server)/fd \| wc -l`、`lsof -p <pid> \| wc -l`、`VmRSS` | ✅ 20:35:08 / 20:46:03 / 20:55:48 三次全部 **`fd=13`、`lsof=29`、`RSS=8664KB`**，差值 **0 / 0 / 0** |
+| | 客户端断开后回落 | 同上 | ✅ `fd=10`、`lsof=26`、`RSS=8664KB`。**10 个 fd 全部有归属**：3 个标准 fd + 1 个监听 socket + 6 条常驻 MySQL 连接（主线程 + 4 个工作线程 + 分析线程，日志里 6 条 `本线程已建立 MySQL 连接` 逐一对上），**无残留、无增长** |
+| | 分析周期产出 | `SELECT COUNT(*), COUNT(DISTINCT period_end) FROM analysis_result;` | ✅ 长跑期间共 27 个周期、364 行（开跑前 PC-01 无数据的周期不写库，之后每周期 12~16 组，与"哪些 client 在 600s 窗口内有数据"逐一对得上） |
+| S8-5 | DoD 逐条对照 | `docs/任务C-服务器端.md` §7 | ✅ 五条**全部打勾**，其中"10 小时"一条按"已有证据 + 注明口径"处理（S7 10 分钟 + S8 25 分钟并发长跑 + memcheck 零泄漏为依据，任务书里如实标注"10 小时挂机未做"） |
+
+**附加验证**
+
+| 检查 | 结果 |
+|---|---|
+| `possibly lost` 判读口径 | ✅ 117,192 字节 / 92 块 = **1,280 字节**（4 个工作线程的 TLS，= 4×320）+ **115,912 字节**（4 条 MySQL 连接的内部缓冲，22 条记录，最大的两条 65,664 / 32,924 字节）；23 条记录**全部**写着 "in 4 blocks"，即每个常驻工作线程一份，**不是泄漏**；口径已写进 `运行说明.md` §6 |
+| 优雅退出（长跑后） | ✅ SIGINT → `select 主循环已退出` → `分析线程已收到退出请求，退出` → `数据库连接已关闭（mysql_library_end 已调用）` → `收到退出信号，服务器正常退出`；`pgrep -ax server` 无残留 |
+| 一个易被误判的观察 | 本轮三个 probe 用了**同一个 `--seed` 默认值**，所以三者发送的数值序列完全相同（服务器日志显示三个不同 fd/client_id 收到同一组数值）——这**不是串包**，S7 已用"三个 profile 取值域互不重叠"独立证明过数据不串（§二十四）。下次做隔离性验收记得给每个 probe 传不同 `--seed` |
+
+> **S8 结论**：S8-1~S8-5 **全部通过**。问题 40 的 `definitely lost` 复测归零，S7 遗留的唯一未达标项已闭合；
+> `运行说明.md` 按"只照文档操作"从零走通（含删库重导），DoD 五条打勾（"10 小时"如实注明口径）。
+> 剩余工作是 **S9 联调**：与任务 B 客户端拼合、再接任务 A，按 `docs/接口规范.md` §6 清单验收。
+
+---
+
+## 二十八、S8 实现要点（供 S9 联调参考）
+
+1. **交接的第一件事是"看端口，不是问人"**：`pgrep -ax server` 与 `ss -ltn | grep 9000` 两问，非空就先处理（问题 43）；
+   停服同样两问复核（问题 41）。服务器的生命周期**不随发起它的 ssh 结束**——`setsid nohup` 起的实例会一直活着。
+2. **抓证据先落文件再筛**（问题 44）：`python3 -u probe.py … > /tmp/probe.txt 2>&1`，之后随便 `head`/`grep` 那个文件。
+   把 `head` 接在管道里会让被测进程收到 SIGPIPE 提前退出，拿到的是"半截证据"，而且**看起来完全正常**。
+   判断证据是否完整，一律用"两边对账"：客户端打印的条数 vs 服务器日志 vs 数据库行数。
+3. **memcheck 判读口径（复述，联调后如再测请沿用）**：只认 `definitely lost` 与 `indirectly lost`，两者都必须为 0；
+   `possibly lost: 117,192 bytes in 92 blocks` 是 4 个常驻工作线程的 TLS + 各自一条 MySQL 连接，**不是泄漏**。
+   要跑就跑到"登录 + DATA + 告警 + 跨一个分析周期"再 `Ctrl-C`，`-t 3600` 那种跑法只能当对照实验、不能当验收（§二十五 要点 1）。
+4. **`src/cJSON.c` 不许整份覆盖**：它带着 S2 的 8 行 `__thread` 本地补丁（修 4 个工作线程并发解析的数据竞争，问题 24）。
+   升级 cJSON 版本时**只搬补丁、不搬文件**：`git diff src/cJSON.c` 应当始终只有那一处。
+5. **交付口径未变**：接口规范 §3.1/§3.2/§3.3/§4 的字段、错误码、表结构一字未动；
+   S8 新增的 `db_close_this_thread()` 是模块内部接口，不出现在任何 JSON 报文里。
+6. **联调前先确认三件事**（S9 会把 B/C/A 三端接起来）：
+   ① 虚拟机桥接 IP（校园网 DHCP 会变，`ip -br addr show ens33`）；
+   ② 阈值改过就要**重启服务器**（`threshold_cfg` 只在启动时读一次）；
+   ③ 调试用的 `-t/-w` 记着改回默认（60/600），否则客户端会按错误的节奏等 ANALYSIS。
+7. **`运行说明.md` 本身就是验收物**：S8 的"从零复现"是**只照文档操作**走通的（§二十七 S8-3），
+   后续任何人改动了启动方式/依赖，都要同步改它——它不只是给人看的说明，是"新人 5 分钟跑起来"这条 DoD 的证据。
