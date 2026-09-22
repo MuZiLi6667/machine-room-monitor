@@ -25,7 +25,7 @@ machine-room-monitor/
 ├── docs/            文档（见上表）
 ├── stm32-firmware/  任务A交付：Keil工程 + hex + 接线表
 ├── client-qt/       任务B交付：Qt源码 + exe
-├── server-linux/    任务C交付：源码 + Makefile + sql/init.sql
+├── server-linux/    任务C交付：源码 + Makefile + sql/init.sql + 运行说明.md
 └── simulator/       共享联调工具（见下）
 ```
 
