@@ -1,68 +1,62 @@
 /*
- * main.c —— 程序入口（S0 版本：只打印启动日志并可正常退出）
+ * main.c —— 程序入口（S1 版本：接入 net/session，select 回显骨架）
  *
  * 本文件是"组装者"：唯一知道所有模块的文件（规划 §2.2）。
- * S0 阶段仅验证工程骨架可编译、可运行、可被 Ctrl-C 正常终止；
- * S1 起此处将替换为 net_init() + net_loop()，S6 再补 getopt 命令行参数。
+ * S1 阶段的全部业务就是 net_loop 里的 echo 占位，主循环本身在 net.c。
+ * S2 接入线程池、S6 补 getopt 命令行参数（-p/-t/-w）。
  */
 #include <signal.h>
-#include <stdio.h>
-#include <unistd.h>
+#include <stddef.h>
 
 #include "config.h"
 #include "log.h"
+#include "net.h"
 
-/* 退出标志：信号处理函数里只能写 sig_atomic_t */
-static volatile sig_atomic_t g_running = 1;
-
+/* 退出标志由 net 模块持有，信号处理函数只负责通知它。
+ * 只做一次赋值，满足异步信号安全要求（不能在这里打日志/加锁）。 */
 static void on_signal(int signo)
 {
     (void)signo;
-    g_running = 0;
+    net_stop();
 }
 
 int main(void)
 {
-    sigset_t mask;
-    sigset_t oldmask;
     struct sigaction sa;
 
     /* 1. 初始化日志 */
     log_init(LOG_TAG);
 
-    /* 2. 打印启动日志（S0 的全部业务） */
+    /* 2. 启动信息 */
     log_info("==================================================");
     log_info("机房环境多指标远程监测与分析系统 —— 服务器端");
-    log_info("版本 S0：工程骨架，业务逻辑自 S1 起逐步接入");
+    log_info("版本 S1：select 回显骨架（net + session 分帧）");
     log_info("监听端口   : %d", SRV_PORT);
     log_info("心跳/超时  : %ds / %ds", HEARTBEAT_INTERVAL_SEC, SESSION_TIMEOUT_SEC);
     log_info("分析周期/窗口: %ds / %ds", ANALYSIS_PERIOD_SEC, ANALYSIS_WINDOW_SEC);
     log_info("数据库     : %s@%s/%s", DB_USER, DB_HOST, DB_NAME);
     log_info("==================================================");
 
-    /* 3. 注册退出信号：Ctrl-C(SIGINT) / kill(SIGTERM) 均走正常退出流程 */
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-
-    /* 先屏蔽，避免"判断标志"与"sigsuspend"之间丢信号 */
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
-
+    /* 3. 注册退出信号。不设 SA_RESTART：让阻塞中的 select 返回 EINTR，
+     *    主循环据此回到顶部检查退出标志（见 net.c） */
     sa.sa_handler = on_signal;
-    sa.sa_mask    = mask;
-    sa.sa_flags   = 0;                 /* 不设 SA_RESTART，保证 sigsuspend 被唤醒 */
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    log_info("服务器已就绪，按 Ctrl-C 退出");
-
-    /* 4. 主循环：S0 阶段空转等待退出信号；S1 起此处为 net_loop() */
-    while (g_running) {
-        sigsuspend(&oldmask);          /* 原子地解除屏蔽并等待信号 */
+    /* 4. 网络初始化（创建监听 socket） */
+    if (net_init(SRV_PORT) < 0) {
+        log_err("网络初始化失败，服务器退出");
+        return 1;
     }
 
-    /* 5. 收尾 */
-    sigprocmask(SIG_SETMASK, &oldmask, NULL);
+    log_info("服务器已就绪，按 Ctrl-C 退出");
+
+    /* 5. select 主循环：阻塞运行，直到收到退出信号 */
+    net_loop();
+
+    /* 6. 收尾 */
     log_info("收到退出信号，服务器正常退出");
     return 0;
 }
