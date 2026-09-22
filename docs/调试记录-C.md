@@ -1040,3 +1040,80 @@ S4-1 跑完（行数 0 → 64，增长正确），但为 S4-2 准备的"probe �
 6. 一条 DATA = 4 次 `mysql_query` 往返，2 秒周期余量充足。S6 的聚合查询若变慢，先看任务队列水位（§十 要点 5 的背压：`pool_submit` 队列满会顶住主线程）。
 7. 本步**未跑** helgrind / memcheck（规划里属 S7）。已知形态供 S7 判读：4 个工作线程常驻不退出，它们的连接与 TLS 在进程退出时表现为 `still reachable`——判读标准仍按 §九：**只看 `definitely lost` 是否为 0**。
 8. 抓 Python probe 的输出做证据时记得 `-u`（问题 30）；重定向 + 被杀 = 缓冲丢失，会得到"空文件"这种假证据。
+
+---
+
+## 十七、S5 阶段问题记录（阈值告警）
+
+### 问题 32：验收脚本自己先崩了两次——证据工具没自检
+
+**现象**
+S5-1 第一次跑：`UnboundLocalError: cannot access local variable 'buf' where it is not associated with a value`；修掉再跑：TCP 连上了、LOGIN_ACK 也收到了，但 **DATA 一条都没发出去**，脚本静默结束。
+
+**定位**
+两个都是临时验收脚本（仓库外 `s5_probe.py`）自身的 Python 错误，与服务器无关：
+① 在嵌套函数 `drain()` 里写 `buf += chunk`，漏了 `nonlocal buf` → 局部变量未绑定即使用；
+② `args = sys.argv[4:]` 已经切过片，循环下标却仍从 4 起 → `while i < len(args)` 直接不成立 → 消息列表恒为空。
+
+**原因**
+与问题 28、30 同一类：**采集证据的工具本身没验过**。第 ② 个尤其危险——脚本不报错、连接正常、连 LOGIN_ACK 都正常收到，唯一的问题是"什么都没发"；输出里那句"没有告警"完全可以被读成"服务器不告警"。
+
+**解决**
+改脚本（补 `nonlocal`、下标从 0 起）。经验：验收脚本改完先做一次**反证**——故意发一条必然超标的 DATA，**必须先看到 ALARM 才认可脚本**；安静通过 = 工具不可信，先查工具。
+
+### 问题 33：ALARM 的 ts 比同批 DATA 的 ts 晚 2 秒——宿主/虚拟机时钟差
+
+**现象**
+probe 发出的 `#2` 是 `"ts": "2026-09-22 18:45:47"`，服务器推回的 ALARM 是 `"ts":"2026-09-22 18:45:49"`，看起来"告警迟了 2 秒才到"。
+
+**定位**
+probe 跑在**宿主机**上（ts 是宿主机时钟），而 ALARM 的 ts 由服务器用**虚拟机**时钟 `strftime` 生成。两者相差约 2 秒，与问题 31 实测的 +2.02s 完全吻合。服务器侧其实是毫秒级响应——日志里同一时刻相邻两行就是 `告警：sensor=2…` 与 `DATA：… 入库 4/4 行`。
+
+**原因**
+不是缺陷，是问题 31 的同一环境偏差第一次以"两个时间戳同屏出现"的形式暴露。而且**规划 S5 任务 2 本就规定 ALARM 的 ts 用服务器当前时间**，它与客户端采集时刻（DATA 的 ts）允许不同——即使两端时钟分秒不差，网络与入库耗时也会让二者差几十毫秒。
+
+**解决**
+不修代码。判读口径沿用问题 31：**只在同一侧时钟内部比对**（ALARM 的 ts 对服务器日志时间戳、DATA 的 ts 对宿主机侧记录），跨侧比较时先把 2 秒偏差算进去。联调前建议在虚拟机执行 `sudo timedatectl set-ntp true`。
+
+---
+
+## 十八、S5 验收结论
+
+**产出**：新增 `src/alarm.c` / `src/alarm.h`（阈值判定、ALARM 组包与推送、告警入库）；改动 `db.c`/`db.h`（`db_insert_alarm`、`db_load_thresholds`、新增 `db_threshold_t` 与 `db_threshold_get`、新增带结果集的 `db_query` 复用重连逻辑）、`proto.c`（DATA 分支逐值接入 `alarm_check`）、`main.c`（启动时加载阈值、版本行）。`make clean && make` **零警告零错误**。**接口规范 §3.1/§3.2/§4 字段零改动**（DATA 仍不回包；ALARM 字段与顺序逐字对齐 §3.1）。
+
+**验收命令与实测输出**（同一台服务器、一份连续日志 `/tmp/s5.log`；验收前 `alarm_log` 原有 **0** 行、`sensor_data` 最大 id 为 **204**；客户端为仓库外临时脚本 `s5_probe.py`，登录后逐条发 DATA 并打印全部回包）
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S5-1 | `python -u s5_probe.py 10.202.57.4 9000 S5-A '{"type":"DATA","ts":"2026-09-22 18:44:30","sensors":[{"id":1,"v":35.2}]}'` | 立即收到 ALARM：level=HIGH、sensor=1、value=35.2、threshold=26、msg 含"温度"；`alarm_log` 新增一行且字段一致 | ✅ 收到 `{"type":"ALARM","level":"HIGH","sensor":1,"value":35.2,"threshold":26,"msg":"温度超上限","ts":"2026-09-22 18:44:20"}`；库中 id=1 `S5-A / 1 / 35.20 / 26.00 / HIGH / 2026-09-22 18:44:20` —— 与推送逐字段一致（threshold=26 即被越过的**上限**） |
+| S5-2 | 同上脚本发 `{"id":1,"v":10.0}` | ALARM 推送，msg 为低于下限方向 | ✅ 收到 `{"type":"ALARM","level":"HIGH","sensor":1,"value":10,"threshold":18,"msg":"温度低于下限","ts":"2026-09-22 18:44:40"}`；库中 id=2 `10.00 / 18.00 / HIGH` —— threshold 换成**下限** 18 |
+| S5-3 | 发 `{"id":3,"v":500}` 与 `{"id":4,"v":10000}` | 烟雾超 400 → level=HIGH 告警；光照 → **无**告警 | ✅ 烟雾：`{"type":"ALARM","level":"HIGH","sensor":3,"value":500,"threshold":400,"msg":"烟雾超上限","ts":"2026-09-22 18:44:47"}`，库中 id=3 同值；光照：**无回包**、`alarm_log` 无新行（该值仍正常入库 `sensor_data` id=208） |
+| S5-4 | 连发 3 条 `{"id":1,"v":30}` | 收到 3 条 ALARM，`alarm_log` 增 3 行（不去重） | ✅ 3 条 ALARM（ts 18:44:59 / 18:45:00 / 18:45:02，逐条对应 3 条 DATA）；库中 id=4/5/6 三行全为 `30.00 / 26.00 / HIGH` —— 未做任何去重 |
+| S5-5 | 发 §3.3 标准向量 `25.6 / 55.0 / 312 / 356`（全在阈值内） | 无 ALARM、`alarm_log` 无新行 | ✅ **无回包**；`alarm_log` 仍为 6 行（id 1~6）；该条 4 个值正常入库（`sensor_data` id 212~215，collect_time = `2026-09-28 15:00:01`） |
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| **MID 级别路径**（S5-1~5 只覆盖了 HIGH） | ✅ 湿度 80（上限 60）→ `{"type":"ALARM","level":"MID","sensor":2,"value":80,"threshold":60,"msg":"湿度超上限",…}` —— level 确实取自 `threshold_cfg` 而非硬编码 |
+| **边界值用严格不等号** | ✅ 湿度 60.0（=上限）不告警；probe 实测烟雾 400（=上限）也不告警 —— 只有严格越界才算超标 |
+| **NULL 侧不检查** | ✅ 烟雾发 0（低于任何"下限"）不告警 —— `min_value` 为 NULL 时该侧判定天然不成立 |
+| **一条 DATA 多个值同时超标** | ✅ `{"id":1,"v":30},{"id":2,"v":80}` → 同一次收到 2 条 ALARM（温度 HIGH + 湿度 MID），库中 id=8/9 两行 |
+| **真实数据流（端到端）** | ✅ 13 秒 probe（`--id S5-C`）共 7 条 DATA → 收到 6 条 ALARM，与逐值手算完全一致（#4、#5 两条全在阈值内，确实无告警）；库中 `alarm_log` 分组统计 `sensor 1 HIGH ×2 / sensor 2 MID ×3 / sensor 3 HIGH ×1` = 6 条，`sensor_data` 28 行 = 7×4 |
+| **DATA 依然不回包**（接口规范 §3.1 未定义应答） | ✅ S5-5 的正常值 DATA 与 S5-4 的 3 条超标 DATA 均未收到任何非 ALARM 回包；S5 只新增了规范定义的 ALARM 主动推送 |
+| **并发告警 + helgrind 数据竞争检测** | ✅ 两个客户端并发（HG-1 温度/湿度、HG-2 烟雾/光照）同时触发告警互不干扰；在 helgrind 下跑完整轮收发与告警后优雅退出，报告 `ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 457 from 87)` —— **零数据竞争**（S5 新增的"工作线程只读阈值缓存"路径无竞争，与 S2 那次的判读口径一致） |
+| 服务器错误日志 | ✅ 全程 `grep -c '\[ERROR\]'` = **0**；9 条告警 INFO 日志分布在不同 tid（工作线程）上 |
+| 优雅退出回归（S0-6/S1~S4） | ✅ SIGINT 后依次打印 `select 主循环已退出` → `数据库连接已关闭` → `收到退出信号，服务器正常退出`；`pgrep -ax server` 无残留、9000 端口释放 |
+
+---
+
+## 十九、S5 实现要点（供 S6/S7 参考，避免踩坑）
+
+1. **阈值缓存由 db 模块持有、启动时一次填好、此后只读**：`db_load_thresholds()` 在主线程（`pool_init` 之前）把 `threshold_cfg` 转成 `db_threshold_t` 数组，`alarm.c` 经 `db_threshold_get()` 读。只读 + `pthread_create` 的 happens-before = 无需加锁；**S6 若也要用阈值（over_count 要判超限），直接调 `db_threshold_get` 即可**，不要再查一次库、也不要自己缓存一份。
+2. **`db_query()` 是 S5 为"带结果集的 SELECT"新增的**（`db_exec` 只处理无结果集的语句），带与 `db_exec` 相同的"断线重连一次"。S6 的聚合查询走它。
+3. **告警判定在 DATA 入库循环里逐值进行，且无条件调用**：即使某个值 `db_insert_sensor` 失败也照做阈值判定——ALARM 是给客户端的实时通知，不该被 `sensor_data` 的写入失败连累；两边各自记日志。
+4. **判定口径**：严格不等号（等于边界不算超标）、NULL 侧不检查、"没有配置行"= 该传感器不告警（光照）。`threshold` 字段给**被越过的那个边界**。
+5. **ALARM 的 ts 是服务器时间**（`strftime` 直接生成，不走客户端输入专用的 `proto_datetime_ok`），与 DATA 里的 ts（客户端采集时刻）**允许不同**——宿主机/虚拟机的 2 秒偏差会让这两个数字看起来"对不上"，判读见问题 33。
+6. **`alarm_send` 与 `proto_reply` 同构但各写各的**：JSON 文本与 `'\n'` 必须在同一次 `net_send` 里发出（拆开会被别的线程插队）。这是刻意保留的十行重复，不要为了"复用"去改 proto 的对外契约。
+7. 本步跑过一次 **helgrind**（并发告警场景，`ERROR SUMMARY: 0 errors`，见 §十八），主要是为了验证 S5 新增的"工作线程只读阈值缓存"这条跨线程路径——结论是安全，靠的是"启动阶段填好 + 之后只读 + `pthread_create` 的 happens-before"，**不要**日后为了"保险"给它加锁（加锁反而会引入锁序问题）。memcheck 仍未跑（属 S7）；已知形态与 S4 相同：常驻工作线程的 TLS 表现为 `still reachable`，判读只看 `definitely lost` 是否为 0。
+8. 日志里每条告警一行 `client_id=X 告警：sensor=n(名称) value=… >/< threshold=… level=… msg="…" ts=…`，S7 压测统计告警条数直接 `grep -c '告警：'` 即可（与 `alarm_log` 的行数应一致）。

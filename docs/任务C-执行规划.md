@@ -7,7 +7,7 @@
 > 2. 严格按【验收标准】逐条自测，全部通过后在该步骤前的复选框打勾，并在 `docs/调试记录-C.md` 记录过程。
 > 3. 接口字段（JSON格式、表结构、端口、阈值）**以 `docs/接口规范.md` 为唯一依据，禁止擅改**。
 >
-> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☑　S4 ☑　S5 ☐　S6 ☐　S7 ☐　S8 ☐
+> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☑　S4 ☑　S5 ☑　S6 ☐　S7 ☐　S8 ☐
 
 ---
 
@@ -302,7 +302,7 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 
 ---
 
-### ☐ S5 告警：阈值判定 + ALARM 推送与入库（对应任务书 C4.1~C4.2，约0.5天）
+### ☑ S5 告警：阈值判定 + ALARM 推送与入库（对应任务书 C4.1~C4.2，约0.5天）
 
 **目标**：`alarm.c`——每条 DATA 的每个值过一遍阈值检查，超标即推送 ALARM 并写 `alarm_log`。
 
@@ -329,6 +329,17 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 | S5-5 | 正常值 DATA（全在阈值内） | 无 ALARM、alarm_log 无新行 |
 
 **常见坑**：DECIMAL 从 MySQL 读出来是字符串，用 `strtod` 转；threshold 字段在 ALARM 里是被越的那个边界（超上限→threshold=max）。
+
+> 实现记录：
+> 1. **阈值缓存放在 db 模块**：只有 `db.c` 能 `#include <mysql/mysql.h>`（铁律 1），所以 `db_load_thresholds()` 读表后把每行转成普通 C 结构（`db_threshold_t`）存进 db.c 内部的静态数组，`alarm.c` 经**新增**的 `db_threshold_get()` 读取——§2.3 冻结的三个签名一字未改，只新增了一个 getter 和一个结构体。
+> 2. **min/max 为 NULL = 不检查该侧**：DECIMAL 列取回来是字符串，为 NULL 时拿到的是 C 的 NULL 指针，据此置 `has_min/has_max = 0`。烟雾 `min_value` 是 NULL，所以"烟雾低于下限"这条判定天然不成立（附加验证里烟雾 0 不告警）；光照不插行 → 没有槽位 → `db_threshold_get` 返回 -1 → 不告警。
+> 3. **`db_insert_alarm` 的 alarm_time 用 SQL 的 `NOW()`**：§2.3 冻结的签名没有时间参数。它与 ALARM 推送里的 `ts`（`alarm.c` 用 `strftime` 生成，本步任务 2）同为服务器时钟，实测同一秒。
+> 4. **ALARM 由 alarm.c 自己组包**（cJSON），JSON 文本与 `'\n'` 仍在**同一次** `net_send` 内发出。没有复用 `proto_reply`：它是 proto.c 内部的 static，跨模块复用等于改 proto 契约；重复十行同构代码换取模块边界清晰。字段与顺序严格按 §3.1：type/level/sensor/value/threshold/msg/ts。
+> 5. **判定用严格不等号**（`value > max` / `value < min`）：值恰好等于边界不算超标。实测烟雾 400（=上限）不告警。
+> 6. **DATA 依然不回包**：S5 只新增了规范 §3.1 定义的 ALARM 主动推送，没有给 DATA 加 ACK（调试记录 §十六 要点 4）。
+> 7. 新增错误码/字段：**无**。接口规范 §3.1/§3.2/§4 零改动。
+>
+> 验收 S5-1~S5-5 全过，命令与实测输出见 `docs/调试记录-C.md` §十八。
 
 ---
 

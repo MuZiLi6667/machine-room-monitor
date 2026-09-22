@@ -14,6 +14,19 @@
 #ifndef DB_H
 #define DB_H
 
+#define DB_LEVEL_LEN 9      /* threshold_cfg.level VARCHAR(8) + 结尾 '\0' */
+
+/* 一个传感器的阈值配置（threshold_cfg 一行的只读副本）。
+ * has_min / has_max 为 0 表示该侧在表里是 NULL → **不检查该侧**
+ * （烟雾只有上限，min 就是 NULL）。level 取 LOW/MID/HIGH。 */
+typedef struct {
+    double min_value;
+    double max_value;
+    int    has_min;
+    int    has_max;
+    char   level[DB_LEVEL_LEN];
+} db_threshold_t;
+
 /* 保存连接参数并做一次连通性自检（主线程在 pool_init 之前调用）。
  * 成功返回 0；参数非法或数据库连不上返回 -1（调用方应视为致命错误）。
  * 这里自检的是主线程这条连接，工作线程的连接在各自首次写库时惰性建立。 */
@@ -34,12 +47,26 @@ int db_insert_sensor(const char *client_id, int sensor_type,
  * 机制，见调试记录 §九 的说明）。 */
 void db_shutdown(void);
 
-/* ---- 以下三个属于 S5/S6：S4 只冻结 §2.3 的签名、不填实现 ---- */
-/* 写一行告警（alarm_log 表），S5 实现 */
+/* 写一行告警（alarm_log 表，S5 实现）。
+ *   client_id   ：内部转义防注入
+ *   sensor_type ：1~4，越界返回 -1
+ *   value       ：本次读数；threshold：被越过的那个边界
+ *   level       ：LOW/MID/HIGH（来自 threshold_cfg）
+ * alarm_time 由 SQL 的 NOW() 填——本函数签名（规划 §2.3 冻结）没有时间参数。
+ * 成功返回 0，失败返回 -1（只记日志，不影响调用方继续处理）。 */
 int db_insert_alarm(const char *client_id, int sensor_type,
                     double value, double threshold, const char *level);
-/* 启动时把 threshold_cfg 读进内存，S5 实现 */
+
+/* 启动时把 threshold_cfg 读进内存数组（主线程在 pool_init 之前调用一次）。
+ * 返回读到的行数（可能为 0 = 表空 → 告警不会触发）；查询失败返回 -1。
+ * 加载后这份缓存只读，任意线程可经 db_threshold_get() 读取。 */
 int db_load_thresholds(void);
+
+/* 取某传感器的阈值（读 db_load_thresholds 建立的缓存）。
+ * 成功返回 0 并把配置写进 *out；**无该传感器配置返回 -1**——调用方据此
+ * 判"这型传感器不告警"（光照在 threshold_cfg 里不插行）。S5 起由 alarm.c 使用。 */
+int db_threshold_get(int sensor_type, db_threshold_t *out);
+
 /* 聚合近 10 分钟 → 写 analysis_result，返回生成行数；S6 实现 */
 int db_run_analysis(void);
 

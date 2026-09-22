@@ -6,7 +6,10 @@
  *   type 缺失 / 非字符串 / 未知 → ERROR code=2 "unknown type"
  *   LOGIN                       → 注册 client_id（含踢旧）→ LOGIN_ACK status=0（S3）
  *   HEARTBEAT                   → HEARTBEAT_ACK（S3）
- *   DATA                        → 拆 sensors[] 逐条写 sensor_data（S4），**不回包**
+ *   DATA                        → 拆 sensors[] 逐条写 sensor_data（S4）→ 每个值做
+ *                                 阈值判定，超标则推 ALARM + 写 alarm_log（S5）；
+ *                                 **DATA 本身不回包**（ALARM 是规范 §3.1 定义的
+ *                                 服务器主动消息，不是对 DATA 的应答）
  * 所有 ERROR 都只应答、不主动断开（S2-1~S2-3、S3-6）。
  *
  * 登录态拦截（S3）：DATA/HEARTBEAT 若在 LOGIN 之前到达 → ERROR code=3
@@ -27,6 +30,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "alarm.h"
 #include "cJSON.h"
 #include "config.h"
 #include "db.h"
@@ -186,11 +190,13 @@ static int proto_datetime_ok(const cJSON *ts, char *out, size_t cap)
 }
 
 /*
- * DATA（S4）：登录态拦截 → 拆 sensors[] 逐条写 sensor_data → 记日志。
+ * DATA（S4 入库 + S5 告警）：登录态拦截 → 拆 sensors[] 逐条写 sensor_data →
+ * 每个值过阈值判定（超标推 ALARM）→ 记日志。
  *
- * **本分支任何情况下都不回包**：接口规范 §3.1 没有为 DATA 定义应答，
- * 客户端也不等应答（调试记录 §十三 要点 5）——入库成功与否都不该往连接上
- * 写东西，否则客户端会把它当成未知的服务器主动消息。
+ * **本分支不产生任何"应答"**：接口规范 §3.1 没有为 DATA 定义应答，客户端
+ * 也不等应答（调试记录 §十三 要点 5）——入库成功与否都不该回一条 DATA_ACK
+ * 之类的东西。S5 起连接上可能因本条 DATA 收到 ALARM，但那是规范定义的
+ * **服务器主动消息**（任一 DATA 值超阈值时推送），与"应答 DATA"是两回事。
  *
  * 容错口径（接口规范 §3.2：id 限 1~4、v 收 int 或 float）：
  *   单条 sensor 的 id/v 缺失、非数值、id 非整数或超出 1~4 → 跳过该条并记 WARN，
@@ -273,6 +279,12 @@ static void proto_handle_data(int fd, const cJSON *msg)
         } else {
             skip++;                    /* db 内已记 ERROR 日志 */
         }
+
+        /* S5：同一条 DATA 先入库再告警（规划 S5 任务 3，在入库循环里顺带调用）。
+         * 无论入库成败都做判定——ALARM 是给客户端的实时通知，不该被
+         * sensor_data 的写入失败连累；alarm 内部写 alarm_log 失败会自己记日志。
+         * 传入的是上面拷好的 client_id 本地副本（出锁即失效的裸指针不能给它）。 */
+        alarm_check(fd, cid, sid, v->valuedouble);
 
         /* 汇总成 [1=25.6 2=55 3=312 4=356]，与 S3-2 的日志格式一致，
          * 便于和 SELECT 出来的行逐值核对（S4-2） */
