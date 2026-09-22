@@ -7,7 +7,7 @@
 > 2. 严格按【验收标准】逐条自测，全部通过后在该步骤前的复选框打勾，并在 `docs/调试记录-C.md` 记录过程。
 > 3. 接口字段（JSON格式、表结构、端口、阈值）**以 `docs/接口规范.md` 为唯一依据，禁止擅改**。
 >
-> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☐　S4 ☐　S5 ☐　S6 ☐　S7 ☐　S8 ☐
+> 进度状态：S0 ☑　S1 ☑　S2 ☑　S3 ☑　S4 ☐　S5 ☐　S6 ☐　S7 ☐　S8 ☐
 
 ---
 
@@ -226,7 +226,7 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 
 ---
 
-### ☐ S3 会话协议：LOGIN / HEARTBEAT / 超时（对应任务书 C3.3、C3.5，约0.5天）
+### ☑ S3 会话协议：LOGIN / HEARTBEAT / 超时（对应任务书 C3.3、C3.5，约0.5天）
 
 **目标**：连接生命周期完整——登录、重复登录踢旧、心跳应答、90s 超时断开。
 
@@ -241,6 +241,10 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 4. 任何合法消息（LOGIN/DATA/HEARTBEAT）都 `session_touch` 刷新活跃时间；S1 里占位的 `session_sweep_timeouts(90)` 现在真正执行：超时→日志→`net_close` 回收。
 
 **产出**：proto/session 增量代码。
+
+> 实现记录：**踢旧连接不在工作线程里关**。规划任务 1 写"关旧 fd"、S1 要点 4 也写"net_close 会被工作线程调用（踢旧连接）"，但"工作线程踢旧"与"主线程发现 recv=0"这两条路径会 close 同一个 fd 号，第二次 close 时该 fd 号可能已被新 accept 复用 → **误关一个刚接入的新连接**。改为：`session_login` 只在锁内给旧会话打 `kick` 标记（锁内绝不调 `net_close`，非递归锁会自死锁），主线程每轮经 `session_collect_dead` 摘槽后统一 `net_close`——**close 始终只发生在主线程**。详见 `docs/调试记录-C.md` 问题 26。
+>
+> 自定义错误码（接口规范 §3.1 未定义的路径，规范字段零改动）：`code=3` `not logged in`（未登录先发 DATA/HEARTBEAT）、`code=4` `invalid client_id`（缺失/超长/含非法字符）。
 
 **验收标准**（对照接口规范 §3.3 三条测试向量）：
 | # | 操作 | 预期 |

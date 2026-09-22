@@ -1,5 +1,5 @@
 /*
- * main.c —— 程序入口（S2 版本：线程池 + JSON 解析分发）
+ * main.c —— 程序入口（S3 版本：会话协议 LOGIN/HEARTBEAT/超时）
  *
  * 本文件是"组装者"：唯一知道所有模块的文件（规划 §2.2）。
  * 启动顺序：日志 → 线程池 → 网络监听 → select 主循环（net_loop）。
@@ -32,7 +32,7 @@ int main(void)
     /* 2. 启动信息 */
     log_info("==================================================");
     log_info("机房环境多指标远程监测与分析系统 —— 服务器端");
-    log_info("版本 S2：线程池 + JSON 解析分发");
+    log_info("版本 S3：会话协议（LOGIN / HEARTBEAT / 90s 超时断开 / 踢旧连接）");
     log_info("监听端口   : %d", SRV_PORT);
     log_info("工作线程   : %d 个（任务队列 %d）", POOL_THREADS, POOL_QUEUE_SIZE);
     log_info("心跳/超时  : %ds / %ds", HEARTBEAT_INTERVAL_SEC, SESSION_TIMEOUT_SEC);

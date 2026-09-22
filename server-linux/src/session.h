@@ -22,9 +22,23 @@ int  session_add(int fd);
 void session_remove(int fd);
 
 /* ---- 以下三个属于 S3（LOGIN）实现，S1 仅冻结签名、不填实现 ---- */
-int         session_login(int fd, const char *client_id); /* 绑定 client_id，含踢旧连接逻辑 */
-int         session_is_logged(int fd);                    /* 是否已完成 LOGIN */
-const char *session_client_id(int fd);                    /* 未登录返回 NULL */
+
+/* 绑定 client_id 并置为已登录；同 client_id 的其它已登录会话被标记为"待踢除"。
+ * 成功返回 0；client_id 非法（非 1~31 个 [A-Za-z0-9-_]）或 fd 不在会话表中返回 -1。
+ *
+ * 踢旧不在本函数内关闭连接：本函数由工作线程（proto）调用，持会话表锁期间
+ * 调 net_close 会因 session_remove 再取同一把非递归锁而自死锁；且"关闭 fd"
+ * 必须与 accept/recv 串行（同号 fd 复用会误关新连接）。故这里只打标记，
+ * 由主线程经 session_collect_dead() 统一回收（见下）。 */
+int         session_login(int fd, const char *client_id);
+
+/* 是否已完成 LOGIN。 */
+int         session_is_logged(int fd);
+
+/* 已登录会话的 client_id；未登录或 fd 无效返回 NULL。
+ * 返回的是**会话槽内部指针**，出锁即可能因连接被踢/回收而失效，
+ * 调用方必须立刻拷贝使用——需要稳定副本请用 session_client_id_copy()。 */
+const char *session_client_id(int fd);
 
 /* 刷新最近活跃时间（收到任何消息后调用）。 */
 void session_touch(int fd);
@@ -39,13 +53,26 @@ int  session_feed(int fd, const char *data, int len);
  * 注意：0 与 -1 语义不同，调用方须用 `>= 0` 判断"取到了"。 */
 int  session_next_line(int fd, char *out, int cap);
 
-/* 巡检会话活跃时间：超过 timeout_sec 未收到任何消息的会话打印告警日志。
- * S1：只打印不断开；S3 起在此处执行 net_close 真正回收。 */
+/* 巡检会话活跃时间：超过 timeout_sec 未收到任何消息的会话打印告警日志
+ * （同一段空闲只报一次）。真正的断开由 session_collect_dead() 完成。 */
 void session_sweep_timeouts(int timeout_sec);
 
-/* ---- S1 新增（未改动 §2.3 冻结签名），供 net.c 构造 select 集合 ---- */
+/* ---- S1/S3 新增（未改动 §2.3 冻结签名） ---- */
 /* 取出全部活跃 fd 写入 fds（最多 cap 个），返回实际个数。 */
 int  session_get_fds(int *fds, int cap);
+
+/* S3：摘除"待踢除"（session_login 标记的重复 client_id 旧连接）与"已超过
+ * timeout_sec 无消息"的会话槽，把它们的 fd 写入 fds（最多 cap 个）并返回个数。
+ * 槽位在返回前即清空，故这些 fd 不会再进入 select 集合、不会再被 recv。
+ *
+ * 只由 select 主循环（net.c）调用：槽位摘除后紧接着 net_close(fd)，
+ * 使"关闭连接"这一个动作始终只发生在主线程——多线程各自 close 会在 fd
+ * 号被新连接复用后误关新连接。 */
+int  session_collect_dead(int timeout_sec, int *fds, int cap);
+
+/* S3：把已登录会话的 client_id 拷进调用方缓冲（锁内 memcpy，规避
+ * session_client_id() 裸指针出锁失效的问题）。成功返回 0，失败返回 -1。 */
+int  session_client_id_copy(int fd, char *out, int cap);
 /* 当前活跃会话数量（日志用）。 */
 int  session_count(void);
 

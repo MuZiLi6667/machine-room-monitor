@@ -1,21 +1,30 @@
 /*
- * net.c —— select 网络层（S1 实现，S2 接入线程池）
+ * net.c —— select 网络层（S1 实现，S2 接入线程池，S3 接入会话回收）
  *
- * 结构：net_init 建监听 socket → net_loop 里 select 循环，四件事：
- *   ① 监听 fd 可读 → accept + session_add 登记；
- *   ② 客户端 fd 可读 → recv + session_feed 入缓冲，再逐条取完整行交给
+ * 结构：net_init 建监听 socket → net_loop 里 select 循环，六件事：
+ *   ① 会话巡检与回收（S3）：90s 无消息的超时会话、被新连接顶替的旧连接，
+ *      由 session_collect_dead 摘出后在此 net_close；
+ *   ② 重建读集合（select 会就地修改 fd_set，每轮必须重新 FD_ZERO/FD_SET）；
+ *   ③ select 超时（每 1s）→ 回到循环顶部做 ①，这也是巡检的节拍；
+ *   ④ 监听 fd 可读 → accept + session_add 登记；
+ *   ⑤ 客户端 fd 可读 → recv + session_feed 入缓冲，再逐条取完整行交给
  *      net_on_message → 深拷贝后 pool_submit 投递线程池（S2 起主线程不再
  *      做任何业务处理，业务在工作线程里跑）；
- *   ③ select 超时（每 1s）→ session_sweep_timeouts 巡检空闲会话；
- *   ④ recv 返回 0 / 出错 → net_close 回收连接。
+ *   ⑥ recv 返回 0 / 出错 → net_close 回收连接。
  *
- * 易错点：select 会就地修改 fd_set，所以每轮必须重新 FD_ZERO/FD_SET。
  * 信号：accept/recv/select 都可能被 Ctrl-C 打断返回 EINTR，按"回到循环
  *       顶部重新判断退出标志"处理，不当作错误。
  *
- * 线程模型（S2）：主线程 = accept/recv/分帧/投递；工作线程 = 解析 + 分发 +
- *       回包。因此本文件里 net_send 必须加发送锁（多条消息不能在同一个 fd 上
- *       交错），net_close / session_* 的线程安全由 session 模块的会话表锁兜住。
+ * 线程模型（S2/S3）：主线程 = accept/recv/分帧/投递 + **全部 close**；
+ *       工作线程 = 解析 + 分发 + 回包。因此本文件里 net_send 必须加发送锁
+ *       （多条消息不能在同一个 fd 上交错），net_close / session_* 的线程安全
+ *       由 session 模块的会话表锁兜住。
+ *
+ * 为什么 close 只留给主线程（S3 踢旧连接的关键）：若工作线程直接关闭"被顶替
+ *       的旧连接"，可能与主线程同一时刻关闭**同一个 fd 号**（旧连接正好断开，
+ *       主线程 recv=0 也走 net_close），第二次 close 时该 fd 号可能已被新
+ *       accept 复用，于是误关一个刚接入的新连接。改为主线程统一回收后，
+ *       "摘会话 → close" 全程串行，且被摘除的 fd 不会再进入下一轮 select。
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -116,12 +125,23 @@ int net_loop(void)
         fd_set         rfds;
         struct timeval tv;
         int            fds[MAX_SESSIONS];
+        int            dead[MAX_SESSIONS];
+        int            ndead;
         int            nfds;
         int            maxfd;
         int            n;
         int            i;
 
-        /* ① 每轮重建读集合：select 返回时会就地修改 fd_set */
+        /* ① 巡检与回收（S3）：超时会话（sweep 负责告警日志、collect 负责摘除）
+         *    与重复 client_id 被顶替的旧连接，都在这里断开。放在重建读集合之前，
+         *    被摘除的 fd 本轮就不会再进 select、不会再被 recv。 */
+        session_sweep_timeouts(SESSION_TIMEOUT_SEC);
+        ndead = session_collect_dead(SESSION_TIMEOUT_SEC, dead, MAX_SESSIONS);
+        for (i = 0; i < ndead; i++) {
+            net_close(dead[i]);
+        }
+
+        /* ② 每轮重建读集合：select 返回时会就地修改 fd_set */
         FD_ZERO(&rfds);
         FD_SET(g_listen_fd, &rfds);
         maxfd = g_listen_fd;
@@ -146,17 +166,15 @@ int net_loop(void)
             break;
         }
         if (n == 0) {
-            /* ③ 超时（每 1s 一次）：巡检会话活跃时间 */
-            session_sweep_timeouts(SESSION_TIMEOUT_SEC);
-            continue;
+            continue;                     /* ③ 超时（每 1s）：回到顶部做巡检 ① */
         }
 
-        /* ① 新连接 */
+        /* ④ 新连接 */
         if (FD_ISSET(g_listen_fd, &rfds)) {
             net_accept();
         }
 
-        /* ② 已有连接可读。fds 是 select 之前的快照，每个 fd 只处理一次，
+        /* ⑤ 已有连接可读。fds 是 select 之前的快照，每个 fd 只处理一次，
          *    处理中若关闭了某个 fd，不会重复处理它 */
         for (i = 0; i < nfds; i++) {
             if (FD_ISSET(fds[i], &rfds)) {
@@ -347,14 +365,26 @@ int net_send(int fd, const char *buf)
 
 void net_close(int fd)
 {
+    int left;
+
     if (fd < 0) {
         return;
     }
-    /* 先清会话再关 fd：若顺序相反，新 accept 可能复用同一 fd 号，
-     * 而旧会话槽位还占着它（S3 多线程下尤其要注意） */
+
+    /* 先清会话再关 fd（S1 要点 4）：顺序反了的话，新 accept 若复用同一 fd 号，
+     * session_find 会命中**旧**槽位，session_add 误判"已在表中"而沿用旧数据，
+     * 紧接着的清理还会把这个新连接一起摘掉。 */
     session_remove(fd);
+
+    /* 与 net_send 互斥后再 close：否则"另一线程正拿这个 fd 号 send"与
+     * "close 释放 fd 号 → accept 立刻复用"可能撞在一起，数据会写到新连接上。
+     * 锁序：会话表锁已在上面释放，此处只取发送锁，不构成反向嵌套。 */
+    pthread_mutex_lock(&g_send_lock);
     close(fd);
-    log_info("连接已关闭 fd=%d（剩余会话 %d 个）", fd, session_count());
+    pthread_mutex_unlock(&g_send_lock);
+
+    left = session_count();
+    log_info("连接已关闭 fd=%d（剩余会话 %d 个）", fd, left);
 }
 
 /* 退出前收尾：断开全部会话并关闭监听 fd */

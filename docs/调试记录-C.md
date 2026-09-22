@@ -798,3 +798,136 @@ $ grep -A 12 'loss record' /tmp/mc2.log
 7. **cJSON 要点**：`cJSON_PrintUnformatted` 得到的字符串要用 `cJSON_free` 释放；`cJSON_Parse` 失败返回 NULL，此时**没有**对象可释放（不要对 NULL 调 `cJSON_Delete`）；`cJSON_AddNumberToObject(obj, "code", 1)` 输出的是 `1` 而非 `1.0`（S2-1~S2-3 已逐字节比对）。**`src/cJSON.c` 带一处本地补丁（`global_error` 加 `__thread`，见问题 24），不要再从上游整份覆盖**。
 8. **日志的 `[tid:…]` 是 S2-4 的证据来源**：新增模块请继续用 `log_info/log_warn/log_err`，不要直接 `printf`——否则会丢线程号，且多线程下可能交错。
 9. **并发检测的做法（S7 直接复用）**：虚拟机没装 valgrind 也能跑——`apt-get download valgrind` + `dpkg-deb -x` 解包到 `/tmp/vg`，再用 `VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind` 启动（见问题 22）。S7 压测建议照此跑一轮 `--tool=helgrind`（盯 `Possible data race`）与一轮 `--tool=memcheck --leak-check=full`（**只认 `definitely lost`，`possibly lost` 里那 1152 字节是常驻线程的 TLS，不是泄漏**）。
+
+---
+
+## 十一、S3 阶段问题记录（会话协议：LOGIN / HEARTBEAT / 超时）
+
+### 问题 26：照规划字面"从工作线程关旧连接"会 double close，可能误关新接入的连接
+
+**现象**
+规划 S3 任务 1 写"同 client_id 已有旧连接 → **关旧 fd**"，S1 要点 4 也写"net_close 会被工作线程调用（踢旧连接）"。按字面实现（工作线程处理新连接 LOGIN 时直接 `net_close(旧fd)`）在推演中就暴露出冲突路径：
+
+```
+场景：旧连接 A(fd=5) 正被顶替，同时 A 自己也断开了
+  工作线程：处理 B 的 LOGIN → net_close(5) → session_remove(5) + close(5)
+  主线程  ：select 看到 fd=5 可读 → recv 返回 0 → net_close(5) → close(5)  ← 第二次
+```
+
+两次 `close(5)` 之间若有新连接 D 被 accept，内核会把 **5 这个号复用**给 D，于是第二次 `close(5)` 关掉的是 D——一个刚接入、完全无辜的新连接。这正是 S1 要点 4 想防的"误踢新连接"，只是那个要点只说了 `session_remove` 与 `close` 的**先后顺序**，没覆盖"两个线程各关一次"。
+
+**定位**
+把 S3 新增/既有的全部 `net_close` 调用点逐条列出来，标上执行线程：
+
+| 调用点 | 线程 | 触发条件 |
+|---|---|---|
+| `net_accept` 会话表满 | 主线程 | 新连接但没有空槽 |
+| `net_handle_client` | 主线程 | `recv` 返回 0 / 出错 |
+| `net_shutdown_all` | 主线程 | 进程退出 |
+| **踢旧连接（S3 新增）** | **工作线程** | 同 client_id 重复登录 |
+
+只有最后一行是工作线程——它就是"两个线程关同一个 fd 号"的唯一来源。进一步确认：`session_remove` 是幂等的（重复摘同一个槽无害），但 **`close(fd)` 不幂等**（关一个已经关闭/已被复用的 fd 号是未定义行为），两者被包在同一个 `net_close` 里，缺少"谁有权 close"的仲裁。
+
+另外还有一条死路：若让 `session_login` 在持有会话表锁时直接调 `net_close`，`net_close` → `session_remove` 会再取同一把**非递归**锁 → 自死锁（`session.h` 早已写明"不得在持有会话表锁的状态下再回调本模块"）。
+
+**原因**
+`close(fd)` 的语义是"关闭**这个数字**指向的文件描述符"，而 fd 号会被内核回收复用；只要存在两个线程各自以"连接"为单位发起 close，就必然存在"按连接关闭"与"按 fd 号关闭"的错配窗口。根治办法不是加锁，而是**让 close 有唯一的执行者**。
+
+**解决**
+把踢旧拆成"标记"与"回收"两段，close 全部收敛到主线程：
+
+1. `session_login`（工作线程，持会话表锁）：只给旧会话打 `s->kick = 1` 标记并记 WARN 日志，**绝不在锁内关闭任何东西**；
+2. `net_loop` 每轮开头（主线程，重建 fd_set 之前）调 `session_collect_dead()`：锁内把 `kick` 标记的、以及超时的会话槽**摘除**（槽位清空 → 该 fd 立刻退出 select 集合，不会再被 recv），返回 fd 列表；
+3. 主线程紧接着逐个 `net_close(fd)`——此时"摘会话 → close"全程串行，且同一 fd 号不可能有第二条 close 路径。
+
+顺带把 `net_close` 的 `close(fd)` 段放进**发送锁**内（`net_send` 全程持锁），消除"close 释放 fd 号 → accept 复用 → 另一个线程的迟到 send 写到新连接上"的交错窗口。
+
+复验（`s3_probe.py stress 60`，5 个 client_id 轮转、旧连接有时在踢旧前后主动断开以逼出 fd 复用）：
+
+```
+压力轮次 60，异常 0 轮          ← 每轮都校验"新连接仍能收到 LOGIN_ACK 与 HEARTBEAT_ACK"
+61 次重复登录 / 61 次回收        ← 标记与回收一一对应，无漏收
+0 条 [ERROR]                    ← 全程无异常
+```
+
+### 问题 27：在持会话表锁的函数里调 `session_count()` —— 非递归锁自死锁
+
+**现象**
+`session_login` 成功分支原打算打一条"登录成功（当前会话 N 个）"的日志，直接写了 `session_count()`。写完复查时发现：本函数**正持有** `g_session_lock`，而 `session_count()` 第一件事就是 `pthread_mutex_lock(&g_session_lock)`。
+
+**定位**
+对照 `session.c` 的锁约定——"static 辅助函数假定调用时已持锁，公开函数一律自己加锁"。`session_login` 是公开函数（自己加了锁），它去调另一个公开函数，等于对同一把非递归 mutex 连续加锁两次。
+
+**原因**
+`PTHREAD_MUTEX_INITIALIZER` 初始化的是**默认类型（非递归）**互斥锁，同一线程重复 lock 是未定义行为，Linux/glibc 下表现为直接死锁。且这类死锁只在这个分支被触发，压测若没覆盖"登录成功"就会漏网——上线后才炸。
+
+**解决**
+把计数逻辑抽成 static 的 `session_count_locked()`（假定已持锁），`session_count()` 与 `session_login()` 各自复用它：公开函数仍负责加锁，锁内一律只调 `*_locked` 版本。
+
+```c
+static int session_count_locked(void);     /* 调用方必须已持锁 */
+int        session_count(void);            /* 公开：内部加锁后转调 */
+```
+
+同类检查同步做了一遍：`session_sweep_timeouts` / `session_collect_dead` 里都只用锁内安全的 `session_slot_clear()`，没有再出现"锁内调公开函数"。
+
+### 问题 28：验收脚本每轮都"等满超时"，60 轮压测超出工具时限
+
+**现象**
+踢旧压力脚本跑到 240s 仍未结束，被工具转为后台任务（最终 250s 左右完成，结果正常）：
+
+```
+Command did not complete within its 240s timeout and was moved to the background
+```
+
+**定位**
+脚本每轮固定消耗：等 A 的 ACK 1s + 等 B 的 ACK 1s + 探测 A 是否断开 0.2s + 等 B 的 HEARTBEAT_ACK 2s ≈ 4.2s。60 轮 ≈ 250s。而其中真正必要的等待只有"回包到达"那几毫秒。
+
+**原因**
+读应答的辅助函数 `recv_lines()` 是"**收满 wait 秒**才返回"（循环 `recv` 直到 timeout/EOF），而不是"**收到数据就返回**"。写一次性用例时无感（只等 2s），一旦进循环就被放大 60 倍。
+
+**解决**
+验收脚本改成"收到数据即返回"（保留 timeout 作为上限，用于区分"没有应答"与"有应答"）；等待时间只作为兜底上限。与问题 10（`timeout` 掩盖退出码）、问题 21（`grep` 匹配自由文本假阳性）同类——**验收工具本身的口径要精确，否则会得出与事实相反的结论或白等**。
+
+---
+
+## 十二、S3 验收结论
+
+**产出**：改动 `session.c/h`（`session_login` 含踢旧标记、`session_is_logged`、`session_client_id`、新增 `session_client_id_copy` / `session_collect_dead`、`session_sweep_timeouts` 转为真断开、`kick` 字段）、`proto.c`（LOGIN/DATA/HEARTBEAT 三个 handler 填实、登录态拦截、错误码 3/4）、`net.c`（主线程每轮巡检回收、`net_close` 的 close 段入发送锁）、`main.c`（版本行）。`make clean && make` 零警告零错误。**接口规范 §3.1/§3.2/§3.3 字段零改动**（新增的 code=3/4 只出现在规范未定义的路径上）。
+
+**验收命令与实测输出**（同一台服务器、一份连续日志）
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S3-1 | `python s3_probe.py basic <IP>` 第一条 | 回 `{"type":"LOGIN_ACK","status":0}` | ✅ 回 `{"type":"LOGIN_ACK","status":0}` |
+| S3-2 | 同连接发 §3.3 的 DATA 向量 | 正常接收（日志打印 4 个传感器值），不回 ERROR | ✅ 无任何应答（符合规范：DATA 未定义应答）；日志 `sensors=4 [1=25.6 2=55 3=312 4=356]`，与向量 25.6℃/55.0%/312/356lux 逐一相符 |
+| S3-3 | 同连接发 `{"type":"HEARTBEAT"}` | 回 `{"type":"HEARTBEAT_ACK"}` | ✅ 回 `{"type":"HEARTBEAT_ACK"}` |
+| S3-4 | 连接 A、B 依次用 `PC-01` 登录 | A 被断开，B 收 LOGIN_ACK status=0 | ✅ B 回 `{"type":"LOGIN_ACK","status":0}`；A 收到 EOF（被服务器断开）；B 随后 HEARTBEAT 仍得 ACK。日志：`重复登录：旧连接 fd=4 标记待踢除（新连接 fd=5）` → 1s 后 `回收被顶替的旧连接：fd=4` → `连接已关闭 fd=4` |
+| S3-5 | 登录后静置不发任何消息 | 约 90s 被服务器断开，日志有超时回收记录 | ✅ 13:37:34 登录 → 13:39:04 断开（**整 90s**），客户端在静置 88.2s 时收到 EOF。日志：`会话超时：fd=4 已 90s 无任何消息（阈值 90s）` → `会话超时断开：fd=4 …回收连接` → `连接已关闭 fd=4` |
+| S3-6 | 未登录直接发 DATA | 回 ERROR 且不断连；随后 LOGIN 成功 | ✅ 回 `{"type":"ERROR","code":3,"msg":"not logged in"}`；紧接着 LOGIN 回 `{"type":"LOGIN_ACK","status":0}`、再发 HEARTBEAT 回 ACK（证明连接全程未断） |
+
+> S3-5 的两个数字不矛盾：服务器从"最后一字节到达"起算满 90s 断开；客户端从收到 LOGIN_ACK 后才开始计时，且巡检节拍为 1s，故观察到 88.2s。验收要求"约 90s"，符合。
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| 非法 client_id（规划任务 1 的校验要求，5 种输入） | ✅ 含空格/感叹号、32 字符超长、空串、缺字段、非字符串——**全部回 `code=4 invalid client_id` 且不注册**（紧接着发 DATA 仍被 `code=3` 拦截） |
+| 踢旧 + 旧连接同时断开 的并发压力 60 轮<br>（5 个 client_id 轮转、旧连接有时主动断开以逼出 fd 复用） | ✅ **异常 0 轮**：每轮新连接都正常收到 LOGIN_ACK 与 HEARTBEAT_ACK，无一被误关（问题 26 的修复经此验证） |
+| **数据竞争检测**<br>`valgrind --tool=helgrind ./server` 跑 basic + kick + nologin + badid + stress 12 | ✅ `grep -c 'Possible data race'` = **0**；`ERROR SUMMARY: 0 errors from 0 contexts`（S3 新增的"工作线程打标记 / 主线程回收"跨线程路径无竞争） |
+| **内存泄漏检测**<br>`valgrind --tool=memcheck --leak-check=full ./server` 跑同一组用例 | ✅ `definitely lost: 0`、`indirectly lost: 0`、`still reachable: 0`；`possibly lost: 1,152 bytes in 4 blocks` 仍是问题 25 已定性的常驻线程 TLS（非泄漏）；无 invalid read/write |
+| 服务器错误日志 | ✅ 连续日志 `[ERROR]` = **0**；4 条 WARN 恰好对应 1 次踢旧 + 1 次未登录拦截 + 2 条超时巡检（告警 + 回收） |
+| 优雅退出回归（S0-6/S1/S2） | ✅ SIGINT 后 `select 主循环已退出` → `收到退出信号，服务器正常退出`，无残留进程、端口释放 |
+
+---
+
+## 十三、S3 实现要点（供 S4/S5 参考，避免踩坑）
+
+1. **close 只有一个执行者（主线程）**：工作线程要关连接时，只能"打标记"（`session_login` 的 `kick`），由主线程 `session_collect_dead` + `net_close` 统一回收。S4/S5 若新增"某类消息要主动断开客户端"的需求，照此办——**不要在工作线程里直接调 `net_close`**（问题 26）。
+2. **`session_collect_dead` 是"摘槽 + 交 fd"**，返回的 fd 只应交给 `net_close`；摘槽后该 fd 当轮就退出了 select 集合，不会再被 recv。调用点必须在**重建 fd_set 之前**（`net_loop` 循环开头），顺序反了会让本轮的 fds 快照里还留着已摘除的 fd。
+3. **锁内绝不调公开函数**：`session.c` 的公开函数各自加锁，锁内只能调 `*_locked` / `session_slot_clear` 这类静态辅助（问题 27）。这条对 S4 的 `db_*` 同样适用——`db` 那边计划用 `__thread` 连接，天然规避跨线程竞争，但"锁内套锁"的自死锁仍要自查。
+4. **`session_client_id()` 返回内部指针**（冻结签名如此），出锁即可能失效；**S4 入库前一律用 `session_client_id_copy()`** 拷到本地缓冲再用（proto 的 DATA 分支已是这个写法，直接照抄）。`alarm_check` / `db_insert_*` 的 `client_id` 参数也应来自这个本地副本。
+5. **DATA 分支目前"只记录、不回包"**：S4 接入库时不要把回包加进来——接口规范 §3.1 没有为 DATA 定义应答，客户端也不等应答；日志里的 `[1=25.6 2=55 3=312 4=356]` 汇总格式可直接复用来核对入库值。
+6. **未登录拦截的三个入口已就位**：DATA/HEARTBEAT 在各自 handler 开头判 `session_is_logged(fd)`，未登录回 `code=3` 且**不 touch 活跃时间**（`session_touch` 在判定之后调用）。S4/S5 新增的消息类型同样要先过这道判定。
+7. **刷新活跃时间有两处**：`net.c` 在 recv 到字节时无条件 `session_touch`（"任何字节到达即活跃"的兜底），proto 在处理**合法且已登录**的消息时再显式 touch 一次（对齐规划 S3 任务 4 的表述）。重复 touch 无害，静置场景（S3-5）不受影响。
+8. **验收脚本要"收到即返回"**：本轮压测脚本因"每轮等满超时"把 60 轮拖到 250s（问题 28）。S7 压测请用"收到数据即返回"的读法，超时只作为"没有应答"的判据。
