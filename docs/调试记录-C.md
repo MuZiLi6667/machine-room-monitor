@@ -1312,3 +1312,228 @@ probe 的汇总行正文里含 "ANALYSIS" 三个字，被 `grep 'ANALYSIS'` 一�
 7. **valgrind 的启停姿势**：进程名是 `helgrind-amd64-`，用 `pgrep -f '[v]algrind.bin'` 取 PID 再 `kill -INT`，否则会像问题 34 那样"杀掉了一个不存在的进程"还浑然不觉。
 8. **筛证据带引号**：报文用 `grep '"ANALYSIS"'`，日志级别用 `grep '\[ERROR\]'`（问题 21/39 是同一类假阳性）。
 9. 本步的 getopt 只在启动时解析一次、之后参数只读，因此 `analysis_cfg_t` 可以直接指向 main 的栈变量：`pthread_create` 建立 happens-before，分析线程读到的一定是初始化好的值（与阈值缓存同一套理由）。
+
+---
+
+## 二十三、S7 阶段问题记录（压测与异常测试）
+
+### 问题 40：分析线程的 MySQL 连接从未关闭 —— memcheck 报 definitely lost（**真实缺陷，本阶段唯一一处**）
+
+**现象**
+
+S7 补跑内存检测（S2 以来第一次在**完整功能**下跑，含 db.c 与分析线程）：
+
+```bash
+VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind \
+  /tmp/vg/usr/bin/valgrind --tool=memcheck --leak-check=full --log-file=/tmp/mc7.log ./server
+# 走完登录/DATA/告警/心跳/非法JSON/分析推送一整轮后 SIGINT 退出：
+$ grep -A 6 'LEAK SUMMARY' /tmp/mc7.log
+==4570==    definitely lost: 1,192 bytes in 1 blocks
+==4570==    indirectly lost: 27,786 bytes in 21 blocks
+==4570==      possibly lost: 117,192 bytes in 92 blocks
+==4570==    still reachable: 0 bytes in 0 blocks
+$ grep -c 'Invalid read\|Invalid write\|uninitialised' /tmp/mc7.log
+0                              # 没有越界/未初始化读这类内存错误，只有泄漏
+```
+
+`definitely lost` 不为 0，与 S2 阶段（当时是 0）的结论**不一致**。
+
+**定位**
+
+① **把 45 条 loss record 按调用栈归因**（提取每条记录里含 `.c:` 的用户代码帧）：
+
+| 归属 | 字节数 | 堆栈特征 |
+|---|---|---|
+| **分析线程** | **28,978（1,192 direct + 27,786 indirect）** | `analysis_thread → analysis_once → db_run_analysis → db_query → db_conn → mysql_init/mysql_real_connect/mysql_options` |
+| 4 个常驻工作线程 | 115,912（possibly） | `pool_worker → net_task_run → proto_handle_data → db_insert_sensor → db_conn`，每条都写着 **"in 4 blocks"**（4 个线程各一份） |
+| 4 个工作线程的 TLS | 1,280（possibly） | `pthread_create → pool_init → main`（S2 问题 25 的同一形态，只是每块从 288 涨到 320 字节——新增了 `__thread MYSQL *` 指针） |
+
+② **代码级核对**：`db_shutdown()`（db.c:772）内只有一句 `db_conn_drop();`，注释写明"**主线程这条**"；而 `analysis_thread()` 的退出路径（analysis.c:268）只打一行日志就直接 `return NULL`——**没有任何关闭连接的调用**。
+
+③ **对照实验**（决定性证据）：把分析周期调到 3600s，让分析线程**在整轮测试里不建连**：
+
+```bash
+$ /tmp/vg/usr/bin/valgrind --tool=memcheck --leak-check=full --log-file=/tmp/mc7b.log ./server -t 3600
+# 同样跑一轮 DATA/告警（不跨分析周期），SIGINT 退出：
+$ grep -A 6 'LEAK SUMMARY' /tmp/mc7b.log
+==5369==    definitely lost: 0 bytes in 0 blocks          ← 归零
+==5369==    indirectly lost: 0 bytes in 0 blocks          ← 归零
+==5369==      possibly lost: 117,192 bytes in 92 blocks   ← 与实验组逐字节相同
+```
+
+关掉"分析线程建连"这一条路径，`definitely/indirectly lost` 双双归零，而 `possibly lost` **一字不差**。因果链闭合：泄漏的就是分析线程那一条连接，其余是常驻线程的既定形态。
+
+**原因**
+
+`db_conn()` 把连接存在**线程局部** `__thread MYSQL *tls_conn` 里，S4 定下的策略是"每线程一条连接，工作线程的连接随进程退出由内核回收"（§十五 要点 3）。这在 S4/S5 时是对的——那时没有线程会**真正退出**。
+
+S6 给分析线程加了优雅退出（`analysis_stop()` → `pthread_join()`，见 §二十一），情况就变了：分析线程**真的会退出**，它的 TLS 随线程销毁，`tls_conn` 这个唯一的指针随之消失，那条 MySQL 连接（1,192 字节的 MYSQL 结构 + 27,786 字节的内部缓冲）就再没有任何指针指向它——Valgrind 归类为 `definitely lost`。
+
+工作线程没有 join 机制、进程退出时仍然活着，它们的连接只表现为 `possibly lost`（既有口径，见问题 25）。
+
+**影响面**：**运行期不累积**。分析线程只建一条连接（`db_conn()` 的快路径命中后不再新建），泄漏发生在它退出、进程即将结束的时刻。所以这不是"跑久了耗尽内存"，而是"退出时没释放干净"；但交付口径要求 `definitely lost` 为 0，必须修。
+
+**解决（本次未实施——S7 按约定禁止改业务代码，此处只给出方案）**
+
+必须在**分析线程自己**的退出路径上关（`tls_conn` 是线程局部的，线程一退出主线程就再也拿不到它了，放在 `db_shutdown()` 里够不着）：
+
+1. db.h **新增**一个公开接口，例如 `void db_close_this_thread(void);`，实现就是现有 static 函数 `db_conn_drop()` 的直接转发；
+2. `analysis_thread()` 在 `log_info("分析线程已收到退出请求，退出")` **之前**调用它一次；
+3. 属"新增接口"而非改动冻结签名，与 S5 的 `db_threshold_get()`、S6 的 `db_analysis_*()` 同一套路（§2.3 的接口一字不动）。
+
+> 修完后 `definitely lost` 与 `indirectly lost` 应双双回到 0；`possibly lost` 仍会是 117,192 字节（4 个常驻工作线程的 TLS + 连接），**那是判读口径内的正常形态，不要试图消除**（要消除就得给线程池加 shutdown/join，属规划未要求的复杂度）。
+
+---
+
+### 问题 41：排队的启动命令在旧实例退出后"补位"，看起来像服务器自己重启了
+
+**现象**
+
+S7 收尾停服务器：`pkill -INT -x server` 之后 1 秒，日志里冒出**新实例**的启动横幅，`pgrep` 显示 pid=4233 正监听 9000：
+
+```
+[2026-09-22 20:03:08] [INFO ] 收到退出信号，服务器正常退出      ← 旧实例（2581）退出
+[2026-09-22 20:03:09] [INFO ] 服务器已就绪，按 Ctrl-C 退出      ← 1 秒后又起来一个
+```
+
+而我 19:38 只打算启动一次。
+
+**定位**
+
+```bash
+$ ps -o pid,ppid,lstart,cmd -p 4233
+    PID    PPID                  STARTED CMD
+   4233    4232 Tue Sep 22 20:03:08 2026 ./server
+$ ps -o pid,lstart,cmd -p 4232
+   4232 Tue Sep 22 20:03:08 2026 bash -c cd ~/server-linux && setsid nohup ./server >> /tmp/s7-server.log 2>&1 < /dev/null &
+```
+
+补位实例的**父 bash 启动于 20:03:08**——正是旧实例退出的那一刻；命令行则是我 19:38 发出的**第二条**启动命令。再核对日志：全程只有 18 行的首次横幅与 4958 行的第二次横幅，**没有任何 bind 失败记录**。
+
+**原因**
+
+两条启动命令是**串行**发出的，而第一条的 ssh **没有 `timeout` 包裹**（第一条只是"拉起 + 立即返回"的写法，见问题 23）。后台进程持有会话（问题 23），这条 ssh 一直挂着不返回；bash 串行执行，第二条自然要排队等它。
+
+而第一条 ssh 直到 **server 进程退出**才返回——于是：
+
+```
+19:38:04  第一条 ssh 拉起 server(2581)，ssh 会话挂着（后台进程持有它）
+   …11 分钟压测、kill -9、半行重连、memcheck 全在这期间，ssh 一直挂着…
+20:03:08  pkill -INT 停掉 2581 → 会话释放 → 第一条 ssh 返回
+20:03:08  排队的第二条 ssh 立即执行 → 此刻端口刚好空了 → 新实例 4233 成功 bind
+```
+
+**不是"服务器自己重启"，是排队命令补位**。若旧实例没退出，排队的第二条会 bind 失败并退出（日志里没有 bind 失败记录，正反两面都印证了这条链条）。
+
+**解决**
+
+- 启动/停止类操作**只发一条命令**，且一律用 `timeout N ssh …` 包裹，避免第二条在队列里等着；
+- 发完停止命令必须**复核**：`pgrep -ax server` 为空 **且** `ss -ltn | grep 9000` 无监听，不能只看"我已经发了停止命令"；
+- 启动后同样要 `pgrep -ax server` 确认**只有一个**实例（多实例会有一个 bind 失败，日志里能看到 `Address already in use`）。
+
+---
+
+### 问题 42：S7-4 的判据本身出错——"半截尾巴"的回包码与预期不符
+
+**现象**
+
+S7-4 设计的判据是：重连后只发上一连接半截 JSON 的"尾巴" `25.5}]}`（无换行）——
+
+- 若服务器**残留**了上次的半行，拼接后就是一条完整 DATA → 无回包（静默入库）；
+- 若**没残留**，`25.5}]}` 是残缺 JSON → 应回 `ERROR code=1`。
+
+实测收到的是 **code=2**：
+
+```
+[+   0.32s] -> （原始字节，无换行）'25.5}]}'
+[+   2.33s] -> {"type": "DATA", "sensors": [{"id": 1, "v": 21.5}, ...]}
+[+   2.33s] <- {"type":"ERROR","code":2,"msg":"unknown type"}
+```
+
+**定位**
+
+这条"尾巴"与紧随其后的正常 DATA **同属一条连接**，按 `\n` 分帧必然拼成一行：
+
+```
+25.5}]}{"type":"DATA","sensors":[{"id":1,"v":21.5},...]}
+```
+
+`proto_handle`（proto.c:344）用 `cJSON_Parse` 解析它 —— cJSON 默认**不要求整行被消费完**（等价于 `require_null_terminated=0`），它解析出开头的数字 `25.5` 就成功返回；紧接着 `cJSON_GetObjectItemCaseSensitive(root, "type")` 在一个**数字节点**上当然是 NULL → 走 code=2 分支（proto.c:354）。
+
+**原因**
+
+判据假设"残缺 JSON 一律回 code=1"，但这个输入**并不残缺**：它是"**合法 JSON 值 + 尾部垃圾**"。接口规范 §3.1/§3.2 只定义了两条：
+
+- `{bad` 这类**解析失败** → code=1 `malformed json`（§3.3 明文要求）
+- type 缺失/非字符串/未知 → code=2 `unknown type`
+
+本情形规范未定义，服务器按现有约定回 code=2，**不算违反规范**。真正的错在判据——我又犯了问题 28/32 那一类错误：**拿"我以为的码"当断言，而没有先用反证确认**。
+
+**解决**
+
+- 判据改用**服务端日志里的原始行文本**。S7-4 的决定性证据是重连后这一行：
+
+  ```
+  [2026-09-22 19:58:32] [INFO ] fd=6 [工作线程] 解析消息：{"type": "LOGIN", "client_id": "PC-10"}
+  ```
+
+  它**逐字干净、没有任何前缀残留**——若缓冲真的残留了那半行，这里打印的会是被污染的行（`{"type":"DATA","sensors":[{"id":1,"v":{"type": "LOGIN"…`），而且登录必然失败、收不到 `LOGIN_ACK`。
+- 顺带确认一个**可选的收紧点（本次未改，供 S8 决定）**：若要严格区分"合法值 + 垃圾"与真正的畸形输入，把 `cJSON_Parse(line)` 换成 `cJSON_ParseWithOpts(line, &end, 1)`（要求整行消费完）即可，届时 `25.5}]}` 会归入 code=1。规范没要求，属实现细节。
+
+---
+
+### 观察（非问题）：统计窗口按 `collect_time` 过滤时，会把"未来时间"的行算进来
+
+S7-1 统计中途出现 `client_id = S5-A` 的 4 行落在压测窗口内，一度以为是串包。查证后是**接口规范 §3.3 的测试向量**：
+
+```sql
+SELECT id, client_id, sensor_value, collect_time FROM sensor_data WHERE client_id='S5-A' ORDER BY id DESC LIMIT 4;
+-- 212~215 行：collect_time = 2026-09-28 15:00:01   ← 规范 §3.3 里 DATA 的 ts 就是它
+```
+
+服务器按规范"ts 合法就用该时间入库"，行为正确；但用 `collect_time >= '…' AND <= '…'` 做窗口过滤时，**未来时间戳的行会一直落在窗口内**。统计口径要么显式限定 `client_id IN (...)`（本次做法），要么在文档里注明"client 时间可信"的前提。
+
+---
+
+## 二十四、S7 验收结论
+
+**产出**：**本步零业务代码改动**（S7 是测试步，不改任何 `src/`）。仅在仓库外新增压测脚本 `s7_probe.py`（三个 profile 取值域互不重叠 + 半行/尾巴两条异常用例）。`make clean && make` 仍为**零警告零错误**，**接口规范 §3.1/§3.2/§4 零改动**。
+
+**验收命令与实测输出**（同一台服务器 PID 2581；三个 probe 在宿主机上并行跑，跨机经桥接 `10.202.57.4`）
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S7-1 | `./server` + 三个 probe 并行 600s：<br>`python -u s7_probe.py 10.202.57.4 9000 PC-0{1,2,3} --profile p{1,2,3} --data 600` | 3 客户端并发 10 分钟无崩溃；三 client 行数大致相等、数值各自正确 | ✅ 三个 probe 各 `发 DATA 300 条`（600s÷2s）；**PC-01/PC-02 各收 ANALYSIS 10 条、0 条 ALARM，PC-03 收 ANALYSIS 10 条、ALARM 900 条，三者校验失败均为 0 项**；服务器进程存活、`grep -c '\[ERROR\]'` = **0** |
+| | 期间 `SELECT client_id,sensor_type,COUNT(*),MIN(sensor_value),MAX(sensor_value) … GROUP BY` | 每 client×sensor 行数一致、数值落在本机域 | ✅ **12 行全部 cnt=300**（每 client 1200 行）；数值域 `PC-01 20.00~21.90 / 42.00~44.00 / 120~180 / 200~300`、`PC-02 23.00~24.90 / 50.00~54.00 / 250~320 / 400~500`、`PC-03 30.00~31.90 / 65.00~69.00 / 450~520 / 600~700`，**与三个 profile 逐条吻合** |
+| | 跨域查询（把 A 的域套到 B 上查，应 0 行） | 无串包 | ✅ 返回**空集**；`alarm_log` 增量 `PC-03 HIGH 600 + MID 300 = 900`，**PC-01/PC-02 零条**（告警也没串） |
+| S7-2 | 压测中两次 `ls /proc/$(pgrep -x server)/fd \| wc -l` 与 `lsof -p <pid> \| wc -l` | 稳定不增长（±2 内） | ✅ 计数①(19:59:28) `fd=12 / lsof=28 / RSS=8504KB`；计数②(20:01:29) `fd=12 / lsof=28 / RSS=8504KB` —— **差值 0 / 0 / 0**。10 分钟大压测中另有两次 `fd=13 → 13`（19:41:31 / 19:46:11） |
+| | 压测结束三连接断开后复查 | 回落到基线 | ✅ `fd=10`，与**压测前基线 10 完全一致**；`lsof 29→26`（正好少 3 条连接） |
+| S7-3 | PC-04/PC-05 在线时对 PC-04 `Stop-Process -Force`（等价 kill -9） | ≤90s 回收；其他 probe 正常 | ✅ kill 于宿主机 19:52:33，**服务器 19:52:35 即回收**：`[WARN] recv() 失败 fd=6：Connection reset by peer，回收连接` → `连接已关闭 fd=6（剩余会话 1 个）`；另一客户端 PC-05 全程不受影响，跑满 `发 DATA 75 条、收 ANALYSIS 3 条、ALARM 225 条、校验失败 0 项` |
+| | **补充：真静默 90s 超时**（kill -9 会发 RST，测不到超时路径）——虚拟机内起 PC-06，`kill -STOP` 冻结（socket 保持打开、进程不再响应） | 90s 后被超时回收 | ✅ 最后一条 DATA `19:55:45` → `[2026-09-22 19:57:15] [WARN] 会话超时：fd=6 已 90s 无任何消息（阈值 90s）——本轮巡检回收该连接` —— **正好 90 秒**；冻结期间分析线程仍按周期给它推 ANALYSIS（会话尚未超时），回收后 `fd` 回落至 10 |
+| S7-4 | ① `python -u s7_probe.py … PC-10 --half-line`（发半截 JSON 不换行后断开）<br>② `python -u s7_probe.py … PC-10 --profile p1 --data 8`（重连并发 DATA） | 重连后 LOGIN_ACK，后续 DATA 正常入库 | ✅ 步骤①服务器**只处理了 LOGIN，无任何 DATA 处理记录**（半行只进缓冲、未成帧）；步骤②重连立即 `{"type":"LOGIN_ACK","status":0}`，随后 4 条 DATA 全部 `入库 4/4 行（跳过 0）` |
+| | 服务器日志里重连那条 LOGIN 的原始文本 | 无上次半行的前缀残留 | ✅ `19:58:32 [工作线程] 解析消息：{"type": "LOGIN", "client_id": "PC-10"}` —— **逐字干净**（若缓冲残留，此处会打印被污染的行、登录必然失败）；库中 `PC-10` 共 **16 行**（4×4），数值 `20.00~21.50 / 42.10~43.80 / 152~178 / 241~287` 与脚本发送逐条一致 |
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| **内存泄漏检测（memcheck，本阶段首次在完整功能下跑）** | ⚠️ **发现一处真实缺陷**：`definitely lost: 1,192 bytes in 1 blocks` + `indirectly lost: 27,786 bytes in 21 blocks`，45 条 loss record 全部归因到**分析线程的 MySQL 连接**（堆栈 `analysis_thread → db_run_analysis → db_query → db_conn → mysql_init`）。详见**问题 40** |
+| **对照实验（-t 3600 让分析线程不建连）** | ✅ `definitely lost: 0`、`indirectly lost: 0`，而 `possibly lost: 117,192 bytes in 92 blocks` **与实验组逐字节相同** —— 因果链闭合，同时证明 possibly lost 与分析线程无关 |
+| **possibly lost 的构成判读** | ✅ 117,192 字节 / 92 块 = 4 个常驻工作线程的 **TLS（1,280 字节，问题 25 的同一形态）** + 4 条工作线程 MySQL 连接（115,912 字节，每条记录都写着 "in 4 blocks"）。**按既定口径不是泄漏**（线程随进程退出、无 join 机制） |
+| **非泄漏类内存错误** | ✅ `grep -c 'Invalid read\|Invalid write\|uninitialised'` = **0** —— 没有越界访问、没有未初始化读 |
+| 服务器错误日志 | ✅ 全程（压测 + 异常测试 + memcheck 两轮）`grep -c '\[ERROR\]'` = **0** |
+| 优雅退出回归（S0~S6） | ✅ SIGINT 后依次打印 `select 主循环已退出` → `分析线程已收到退出请求，退出` → `数据库连接已关闭（mysql_library_end 已调用）` → `收到退出信号，服务器正常退出`；`pgrep -ax server` 无残留 |
+
+> **S7 结论**：S7-1~S7-4 四条验收标准**全部通过**。唯一未达标项是**附加**的内存检测：问题 40 的 `definitely lost`（分析线程的连接）须在 S8 收尾前修掉（修法是新增 `db_close_this_thread()` 并在 `analysis_thread` 返回前调用，见问题 40 的"解决"）。S7 按约定**未改业务代码**。
+
+---
+
+## 二十五、S7 实现要点（供 S8/S9 参考，避免踩坑）
+
+1. **memcheck 必须在"完整功能"下跑**：S2 那次 `definitely lost = 0` 是在**还没有 db.c** 的年代得到的，不能拿来给 S7 背书。一接上分析线程的连接，问题 40 就露出来了。S8/S9 再跑泄漏检测，务必用**默认参数**让分析线程真的建连、真的退出（`-t 3600` 那种跑法只能当对照实验，不能当验收）。
+2. **判读口径（复述）**：只认 `definitely lost` 与 `indirectly lost`；`possibly lost` 里的 117,192 字节是 4 个常驻工作线程的 TLS + 各自一条 MySQL 连接，**不是泄漏**。S8 看到这个数字不要当成新问题。
+3. **对照实验是定位泄漏归属的利器**：把可疑路径用参数关掉（本次 `-t 3600`），看哪个计数归零。比逐条读 45 个 loss record 快得多，也比 ASan 更能证明因果。
+4. **压测脚本的三个 profile 取值域互不重叠**，是"数据互不串"的判据：p1/p2 全在阈值内（**收到任何 ALARM 即为串包**），p3 三项超标（每条 DATA 恰好 3 条 ALARM）；再要求 ANALYSIS 的 avg/max/min 落在本机域内。一次压测同时覆盖入库、告警、统计三条推送路径的隔离性。
+5. **"半行残留"类判据别用回包码**：`25.5}]}` 这种"合法 JSON 值 + 尾部垃圾"会被 `cJSON_Parse` 解析成功（不要求整行消费完），走 code=2 而非 code=1（问题 42）。**决定性证据是服务端日志里打印的原始行文本**（`[工作线程] 解析消息：…`）。
+6. **启动/停止服务器只发一条命令并加 `timeout`**：本次两条启动命令串行排队，第一条 ssh 挂到旧实例退出才返回，第二条随即补位把服务器又拉了起来（问题 41）。停服后必须复核 `pgrep -ax server` 为空**且** `ss -ltn | grep 9000` 无监听。
+7. **S7 新增的临时工具都不入库**：`s7_probe.py`（宿主机工作区根目录，仓库外）。仓库内仍只有 S0~S6 的交付物。
