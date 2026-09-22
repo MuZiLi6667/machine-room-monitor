@@ -1,22 +1,29 @@
 /*
- * net.c —— select 网络层（S1 实现）
+ * net.c —— select 网络层（S1 实现，S2 接入线程池）
  *
  * 结构：net_init 建监听 socket → net_loop 里 select 循环，四件事：
  *   ① 监听 fd 可读 → accept + session_add 登记；
  *   ② 客户端 fd 可读 → recv + session_feed 入缓冲，再逐条取完整行交给
- *      net_on_message（S1 占位为 echo，S2 替换成投递线程池）；
+ *      net_on_message → 深拷贝后 pool_submit 投递线程池（S2 起主线程不再
+ *      做任何业务处理，业务在工作线程里跑）；
  *   ③ select 超时（每 1s）→ session_sweep_timeouts 巡检空闲会话；
  *   ④ recv 返回 0 / 出错 → net_close 回收连接。
  *
  * 易错点：select 会就地修改 fd_set，所以每轮必须重新 FD_ZERO/FD_SET。
  * 信号：accept/recv/select 都可能被 Ctrl-C 打断返回 EINTR，按"回到循环
  *       顶部重新判断退出标志"处理，不当作错误。
+ *
+ * 线程模型（S2）：主线程 = accept/recv/分帧/投递；工作线程 = 解析 + 分发 +
+ *       回包。因此本文件里 net_send 必须加发送锁（多条消息不能在同一个 fd 上
+ *       交错），net_close / session_* 的线程安全由 session 模块的会话表锁兜住。
  */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -25,10 +32,26 @@
 #include "config.h"
 #include "log.h"
 #include "net.h"
+#include "pool.h"
+#include "proto.h"
 #include "session.h"
 
 static int                     g_listen_fd = -1;   /* 监听 fd，-1 = 未初始化 */
 static volatile sig_atomic_t   g_running   = 1;    /* 0 = 请求主循环退出 */
+
+/* 发送锁：一条消息必须在一次 send 序列内写完整。多线程回包时若不加锁，
+ * 两条消息的字节流会在同一个 fd 上交错，对端拼出半截 JSON（S2 任务 5）。
+ * 锁序约定：会话表锁 → 发送锁，任何路径都不得反向获取。 */
+static pthread_mutex_t         g_send_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 投递给线程池的任务：回包目标 fd + 消息副本。
+ * 结构体私有于本文件——proto 模块只需要 proto_handle(fd, line) 这个冻结签名。 */
+typedef struct {
+    int   fd;
+    char *line;
+} net_task_t;
+
+static void net_task_run(void *arg);
 
 /* 供信号处理函数调用的唯一入口：只写一个 sig_atomic_t，异步信号安全 */
 void net_stop(void)
@@ -150,6 +173,7 @@ int net_loop(void)
 static void net_accept(void)
 {
     struct sockaddr_in cli;
+    struct timeval     snd_tmo;
     socklen_t          cli_len = sizeof(cli);
     char               ip[INET_ADDRSTRLEN];
     int                fd;
@@ -169,6 +193,15 @@ static void net_accept(void)
     /* 小包实时交互（回显/告警/心跳）关掉 Nagle，避免响应被延迟合并 */
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
         log_warn("TCP_NODELAY 设置失败（不影响运行）：%s", strerror(errno));
+    }
+
+    /* 发送超时兜底：net_send 持全局发送锁，若对端一直不读，阻塞的 send()
+     * 会把其他连接的应答一起拖住。超时后 send 返回 EAGAIN，按发送失败处理
+     * （该连接本就已异常），把"一个坏客户端拖垮全服"降级为"这一个连接失败" */
+    snd_tmo.tv_sec  = SEND_TIMEOUT_SEC;
+    snd_tmo.tv_usec = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tmo, sizeof(snd_tmo)) < 0) {
+        log_warn("SO_SNDTIMEO 设置失败（不影响运行）：%s", strerror(errno));
     }
 
     if (session_add(fd) < 0) {
@@ -224,38 +257,75 @@ static void net_handle_client(int fd)
 }
 
 /*
- * S1 占位业务：收到一条完整消息就原样回显。
- * S2 起本函数改为"深拷贝消息 → pool_submit 投递线程池"，其余流程不动。
+ * 工作线程入口：解析并分发一条消息，随后释放任务自身持有的内存。
+ * 任务的"所有权"在这里终结——主线程 malloc 出来的 line 由工作线程 free，
+ * 中间不经过任何信号量/引用计数，因为每个任务只有唯一的消费者。
+ */
+static void net_task_run(void *arg)
+{
+    net_task_t *t = (net_task_t *)arg;
+
+    if (t == NULL) {
+        return;
+    }
+    proto_handle(t->fd, t->line);
+    free(t->line);
+    free(t);
+}
+
+/*
+ * 收到一条完整消息 → 深拷贝后投递线程池（S2 替换掉 S1 的 echo 占位）。
+ *
+ * 为什么必须深拷贝：line 指向会话槽位内的接收缓冲，本函数返回后主循环立刻
+ * 继续 recv，下一批数据会就地覆盖那块内存；而任务可能还排在队列里没被处理
+ * （规划 S2 常见坑）。
  */
 static void net_on_message(int fd, const char *line, int len)
 {
-    char   out[MAX_LINE_SIZE + 2];
-    size_t n = (size_t)len;
+    net_task_t *t;
+    size_t      n = (size_t)len;
 
     if (n > (size_t)MAX_LINE_SIZE) {
         n = MAX_LINE_SIZE;                /* 防御：session 层已保证不会超 */
     }
 
-    log_info("fd=%d 收到完整消息 %u 字节：%.120s", fd, (unsigned)n, line);
-
-    memcpy(out, line, n);
-    out[n]     = MSG_DELIMITER;           /* 回发时补回分帧符 */
-    out[n + 1] = '\0';
-
-    if (net_send(fd, out) < 0) {
-        log_warn("fd=%d 回显失败，连接可能已断开", fd);
+    t = malloc(sizeof(*t));
+    if (t == NULL) {
+        log_err("fd=%d 内存不足，丢弃本条 %u 字节消息", fd, (unsigned)n);
+        return;
     }
+    t->line = malloc(n + 1);
+    if (t->line == NULL) {
+        log_err("fd=%d 内存不足，丢弃本条 %u 字节消息", fd, (unsigned)n);
+        free(t);
+        return;
+    }
+
+    memcpy(t->line, line, n);
+    t->line[n] = '\0';
+    t->fd      = fd;
+
+    /* 日志留在主线程一侧：与工作线程的"解析消息"日志对照即可验证 S2-4 */
+    log_info("主线程：fd=%d 收到完整消息 %u 字节，投递线程池", fd, (unsigned)n);
+    pool_submit(net_task_run, t);
 }
 
 int net_send(int fd, const char *buf)
 {
     size_t total;
     size_t sent = 0;
+    int    rc   = 0;
 
     if (fd < 0 || buf == NULL) {
         return -1;
     }
     total = strlen(buf);
+
+    /* 持锁期间不允许有其他线程往任何 fd 写：否则同一连接上两条消息的字节
+     * 会交错，对端按 '\n' 切出来的就是坏 JSON。代价是这把锁跨 fd 全局，
+     * 某个客户端迟迟不收（接收窗口打满）会让阻塞的 send() 拖住其余连接，
+     * 由 accept 时设置的 SO_SNDTIMEO 兜底（超时按发送失败返回）。 */
+    pthread_mutex_lock(&g_send_lock);
 
     while (sent < total) {
         ssize_t n = send(fd, buf + sent, total - sent, MSG_NOSIGNAL);
@@ -265,11 +335,14 @@ int net_send(int fd, const char *buf)
                 continue;
             }
             log_warn("send() 失败 fd=%d：%s", fd, strerror(errno));
-            return -1;
+            rc = -1;
+            break;
         }
         sent += (size_t)n;
     }
-    return (int)sent;
+
+    pthread_mutex_unlock(&g_send_lock);
+    return (rc < 0) ? -1 : (int)sent;
 }
 
 void net_close(int fd)

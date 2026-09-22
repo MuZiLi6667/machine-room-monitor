@@ -513,3 +513,194 @@ S1-1/S1-4/S1-5/S1-6 由宿主机侧执行，既补上了工具缺口，也顺带
 4. **`net_close` 里先 `session_remove` 再 `close`**：S1 单线程下两种顺序都安全，但 S3 起 `net_close` 会被工作线程调用（踢旧连接），必须先摘除会话再关 fd——否则新连接可能立刻复用同一 fd 号，而旧会话槽位还占着它，导致误踢新连接。S3 实现踢旧逻辑时务必保持此顺序。
 5. **`net_on_message` 是 S2 的唯一替换点**：S1 的 echo 全在这一个静态函数里，S2 只需把它改成"深拷贝消息 → `pool_submit`"，`net_loop` / 分帧 / 会话层都不用动。
 6. **S1 未加锁**：`session.c` 全程跑在 select 主循环单线程里，故未加互斥锁；S2 引入线程池后需按规划补会话表锁与 `net_send` 发送锁。
+
+---
+
+## 八、S2 阶段问题记录（线程池 + JSON 解析分发）
+
+### 问题 18：`pkill -f 'server-linux/server'` 把承载它的远程 shell 一起杀掉
+
+**现象**
+```bash
+$ ssh vmserver-lan "pkill -f 'server-linux/server'; cd ~/server-linux && setsid ./server ... "
+# 退出码 255，服务器没起来，/tmp/s2.log 也不存在
+```
+
+**定位**
+单独复跑 `pgrep -a -f server-linux/server`：
+```
+4389 bash -c pgrep -a -f server-linux/server; echo '--- listen ---'; ...
+```
+输出里出现了**这条命令自己的 bash 进程** —— 说明 `-f` 匹配的是整条命令行，而远端命令串里正含着 `server-linux/server` 这个模式。
+
+**原因**
+`pkill -f` / `pgrep -f` 匹配整条命令行而非进程名。远端 shell 的命令行本身包含该模式，于是 pkill 杀掉了自己（连同承载它的 ssh 会话），`ssh` 因对端进程被信号终止而返回 255。
+
+**解决**
+只按进程名匹配，不带 `-f`：
+```bash
+pkill -x server      # 进程名精确等于 server，不会误伤 bash
+```
+（或维护 pid 文件 `kill $(cat /tmp/s2.pid)`。）此后巡检一律用 `pgrep -ax server`。
+
+---
+
+### 问题 19：宿主机 `ssh vmserver`（NAT 192.168.48.130）连不上
+
+**现象**
+```bash
+$ ssh vmserver "ls /tmp/cJSON.c"
+ssh: connect to host 192.168.48.130 port 22: Connection timed out
+
+$ ssh vmserver-lan "ip -br addr"      # 同一条虚拟机，桥接地址却正常
+ens37   UNKNOWN   192.168.48.130/24   ← NAT 地址确实存在
+```
+
+**定位**
+虚拟机侧 NAT 网卡有地址、也有默认路由（`default via 192.168.48.2 dev ens37 metric 50`），且出网正常（用 wget 从 GitHub 拉到 cJSON）。问题只在"宿主机 → 客户机"这个反方向。
+
+**原因**
+NAT 网络（VMnet8）保证的是**客户机出向**可用；宿主机经 VMnet8 反向访问客户机是否通，取决于宿主机侧 VMnet8 虚拟网卡与 VMware NAT 服务的状态。这与 S0 记录里对 ens37 的定位一致——它本来就是"专供 apt 出网"的通道。
+
+**解决**
+本阶段全部操作走桥接 `ssh vmserver-lan`（队友联调也走这条）；需要出网的操作（拉 cJSON）在虚拟机内发起，NAT 方向正常。此条记录在案，避免下次把它误判成"虚拟机没开机"。
+
+---
+
+### 问题 20：宿主机 Python 输出中文乱码
+
+**现象**
+验收脚本打印的中文变成 `Ŀ�� 10.202.57.4:9000 ģʽ basic`，而其中的英文与 JSON 完全正常。
+
+**定位**
+脚本文件本身是 UTF-8，Git Bash 终端也是 UTF-8；乱码只出现在 Python 进程的输出上，说明是解释器输出编码环节的问题。
+
+**原因**
+Windows 的 Python 3 默认按**控制台代码页**（中文系统为 GBK）编码 stdout，UTF-8 字节被按 GBK 解码显示。
+
+**解决**
+运行时显式指定输出编码：
+```bash
+PYTHONIOENCODING=utf-8 python s2_probe.py basic
+```
+与问题 11、12 同属"Windows 中文环境编码"一类坑，只是这次发生在输出侧而非脚本解析侧。
+
+---
+
+### 问题 21：`grep -c 'ERROR'` 把 WARN 正文里的"ERROR"当成错误级别（假阳性）
+
+**现象**
+压测结束后统计服务器错误日志：
+```bash
+$ grep -c 'ERROR' /tmp/s2.log
+108                       ← 看着像 108 条错误，其实程序一条错误都没出
+```
+
+**定位**
+按级别字段重新统计：
+```bash
+$ sed -n 's/.*\[\(INFO \|WARN \|ERROR\)\].*/\1/p' /tmp/s2.log | sort | uniq -c
+    241 INFO
+    108 WARN
+```
+级别里根本没有 ERROR；而这 108 条 WARN 的**正文**里写着"回 ERROR code=…"（是日志文案在描述"已回了一条 ERROR 应答"）。
+
+**原因**
+`grep -c 'ERROR'` 匹配整行任意位置，正文里的 "ERROR" 被当成了级别字段。
+
+**解决**
+匹配**带方括号的级别字段**：
+```bash
+grep -c '\[ERROR\]' /tmp/s2.log      # → 0
+```
+教训与问题 15（ping 统计行骗人）同类：**验收统计的口径要匹配到字段，不能匹配自由文本**，否则会得出与事实相反的结论。
+
+---
+
+### 问题 22：valgrind 与 ThreadSanitizer 都不可用（缺 sudo 密码）
+
+**现象**
+```bash
+$ which valgrind || echo 'valgrind 未安装'
+valgrind 未安装
+
+$ sudo -n true
+sudo: 需要密码                      ← 无免密，装不了
+
+$ gcc -fsanitize=thread ... 
+/usr/bin/ld: 找不到 libtsan_preinit.o: 没有那个文件或目录
+```
+
+**定位**
+`/usr/lib/gcc/x86_64-linux-gnu/9/` 下有 `libtsan.a`/`libtsan.so`（运行库在），**唯独缺 `libtsan_preinit.o`**；`-static-libtsan` 绕不过（链接器仍要该文件）；全盘 `find / -name libtsan_preinit.o` 无结果。
+
+**原因**
+虚拟机未安装 valgrind；gcc-9 的 TSan 运行库不完整（包被裁剪），补齐需要 `sudo apt install`，而本机 sudo 有密码、执行 Agent 不持有。
+
+**解决**
+规划里 S2-5 的 valgrind 项本就是"（可选）"，改用**免 root 的 AddressSanitizer** 覆盖同一类风险（S2 新增的任务 malloc/free 生命周期、cJSON 解析树释放），另用加重并发压测补偿做不到的竞争检测：
+```bash
+make CFLAGS='-Wall -Wextra -O1 -g -Isrc -fsanitize=address -fno-omit-frame-pointer'
+./server_asan          # 官方 2×50 与加压 8×200 各跑一轮，最后 SIGINT 优雅退出
+grep -E 'ERROR: (Address|Leak)Sanitizer|SUMMARY|leaked' /tmp/asan.log
+# → 无任何报告（退出码正常，LSan 给出空报告）
+```
+**遗留**：真正的数据竞争检测（TSan/helgrind）本阶段没能做。若 S7 压测前需要补，在本机执行一条 `sudo apt install valgrind` 即可。
+
+---
+
+### 问题 23：ssh 执行"启动后台进程"的命令不返回，被误判为超时
+
+**现象**
+```bash
+$ ssh vmserver-lan "cd ~/server-linux && nohup setsid ./server > /tmp/s2.log 2>&1 < /dev/null & sleep 4; ss -ltn | grep 9000"
+# 长时间无输出 → 工具判定超过 120s 超时，转为后台任务
+```
+但另开一条 ssh 查询，服务器其实早已起来并在监听。
+
+**定位**
+新连接查询 `pgrep -ax server` / `ss -ltn | grep 9000` / `cat /tmp/s2.log` 全部正常，说明命令的实质内容早已执行完毕，只是 ssh 会话本身一直没有结束。
+
+**原因**
+sshd 要等会话内**所有**进程（包括刚 fork 出来的后台进程）都关闭继承来的标准输出/标准输入管道后，才关闭这条通道；后台进程仍持有会话的 pty/管道引用，于是 ssh 一直挂着不返回。
+
+**解决**
+启动类操作按"**启动一条、查询一条**"两步走：第一条 ssh 只负责拉起（不等返回），另开一条 ssh 查询进程与端口来判定结果；必要时加 `ssh -n` 并把 stdin 明确指向 `/dev/null`。本阶段所有服务器启停都按此方式执行。
+
+---
+
+## 九、S2 验收结论
+
+**产出**：新增 `src/pool.c/h`（线程池）、`src/proto.c/h`（cJSON 解析与分发）、`src/cJSON.c/h`（官方 v1.7.18，cJSON.c MD5 `630deb131a520d63b8913492d982b589`、cJSON.h MD5 `a9c6c607caeee91e5fe70dfd349b4ddc`，与上游逐字节一致）；改动 `net.c`（echo 占位 → 深拷贝投递线程池、`net_send` 加发送锁、accept 设 `SO_SNDTIMEO`）、`session.c`（会话表锁）、`main.c`（`pool_init`）、`config.h`（新增 `SEND_TIMEOUT_SEC`）。`make clean && make` 零警告零错误（含 cJSON.c）。
+
+**验收命令与实测输出**
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S2-1 | `python s2_probe.py one '{bad'` | `{"type":"ERROR","code":1,"msg":"malformed json"}`，连接不断 | ✅ 回 `{"type":"ERROR","code":1,"msg":"malformed json"}`；紧接着再发一条仍收到应答，连接未被断开 |
+| S2-2 | `python s2_probe.py one '{"type":"PING"}'` | code=2 `unknown type`，连接不断 | ✅ 回 `{"type":"ERROR","code":2,"msg":"unknown type"}`；再发一条仍收到应答 |
+| S2-3 | `python s2_probe.py one '{"foo":1}'` | 回 code=2 | ✅ 回 `{"type":"ERROR","code":2,"msg":"unknown type"}`（type 缺失与未知 type 同码） |
+| S2-4 | `grep '工作线程\] 解析消息' /tmp/s2.log` + 按 tid 统计 | 主线程只 accept/recv/投递，解析来自工作线程且 tid 不同 | ✅ 日志中出现 **5 个 tid**：`140380596881216`（主线程：新连接/收到完整消息…投递线程池/断开回收）与 4 个工作线程 tid；主线程日志里没有任何"解析"记录 |
+| S2-5 | `python s2_probe.py concurrent 50` | 两个客户端并发各 50 条，无崩溃、无乱序 | ✅ 0 号客户端 50/50 条 code=1、1 号客户端 50/50 条 code=2，回包内容各归各，无串包、无交错 |
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| 加压并发：`python s2_probe.py concurrent 200 8`（8 客户端 × 200 条 = 1600 条） | ✅ 8 个客户端全部 200/200 条回包正确，无串包、无交错 |
+| AddressSanitizer + LeakSanitizer（替代不可用的 valgrind，见问题 22） | ✅ 走完官方 2×50 与加压 8×200 后 SIGINT 优雅退出，**无任何 ASan/LSan 报告** |
+| 服务器错误日志 | ✅ `grep -c '\[ERROR\]' /tmp/s2.log` = **0**；108 条 WARN 恰好对应 108 条非法输入消息 |
+| 退出行为回归（S0-6/S1） | ✅ SIGINT 后依次打印"select 主循环已退出"→"收到退出信号，服务器正常退出"，端口 9000 释放 |
+
+---
+
+## 十、S2 实现要点（供 S3/S4 参考，避免踩坑）
+
+1. **任务内存归属**：`net.c` 里 malloc 的 `net_task_t`（含消息副本 `line`）由工作线程的 `net_task_run` 在处理完后释放——一个任务只有一个消费者，不需要引用计数。新增任务类型时照此约定，**谁投递谁负责不释放、谁执行谁负责释放**。
+2. **分帧符必须和正文同一次发出**：`proto_reply` 把 JSON 文本与 `'\n'` 拼进同一个 buffer 后只调一次 `net_send`。若拆成两次 `net_send`，另一线程的回包会插在中间，对端收到半截 JSON。
+3. **发送锁是全局的**（规划 S2 任务 5 的要求："同一 fd 的多次 send 不交错"）。实现简单，代价是一个不读数据的客户端会让阻塞的 `send()` 拖住所有连接 —— 故在 accept 时设 `SO_SNDTIMEO=10s` 兜底（超时按发送失败返回）。S7 压测若暴露问题，升级方向是"每 fd 一把锁"或"每连接发送缓冲 + 独立写线程"。
+4. **锁序：会话表锁 → 发送锁**，任何路径不得反向。工作线程执行任务时**不持有池锁**（`pool.c` 在调用 `task.fn` 前已解锁），因此任务体里可以安全地调 `net_send` / `session_*`，甚至可以再 `pool_submit` 而不会自死锁。
+5. **`pool_submit` 队列满时阻塞**（背压），不丢任务。S4 起任务体里会有 MySQL 查询，单条变慢会通过背压顶住主线程；那时应关注任务队列水位。
+6. **S3 注意 `session_client_id` 的指针生命周期**：该函数返回的是**会话槽内部指针**，`session.c` 加锁后，出锁那一刻它就可能因连接被踢/回收而失效。S3 实现时应在锁内 `memcpy` 到调用方缓冲（或改由调用方一次性取走所需字段），不要把裸指针传出后再用。
+7. **cJSON 要点**：`cJSON_PrintUnformatted` 得到的字符串要用 `cJSON_free` 释放；`cJSON_Parse` 失败返回 NULL，此时**没有**对象可释放（不要对 NULL 调 `cJSON_Delete`）；`cJSON_AddNumberToObject(obj, "code", 1)` 输出的是 `1` 而非 `1.0`（S2-1~S2-3 已逐字节比对）。
+8. **日志的 `[tid:…]` 是 S2-4 的证据来源**：新增模块请继续用 `log_info/log_warn/log_err`，不要直接 `printf`——否则会丢线程号，且多线程下可能交错。

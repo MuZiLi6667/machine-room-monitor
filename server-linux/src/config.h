@@ -32,6 +32,9 @@
 #define POOL_THREADS           4        /* 工作线程数 */
 #define POOL_QUEUE_SIZE        256      /* 任务队列容量（有界） */
 
+/* ---------- 发送 ---------- */
+#define SEND_TIMEOUT_SEC       10       /* 单次 send 最长阻塞秒数（见 net.c 发送锁说明） */
+
 /* ---------- 业务字段约束（接口规范 §3.2） ---------- */
 #define CLIENT_ID_MIN_LEN      1        /* client_id 长度 1~31 */
 #define CLIENT_ID_MAX_LEN      31

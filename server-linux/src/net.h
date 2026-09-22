@@ -6,8 +6,9 @@
  * 铁律（规划 §2.2）：只有本模块可以调用 socket()/accept()/recv()/send()/close()；
  * 其他模块要回消息一律走 net_send(fd, buf)。
  *
- * 线程模型：S1 为单线程（主线程 select + 处理）。S2 起主线程只负责
- * accept/recv/取行，业务处理移入线程池，届时 net_send 会补上发送锁。
+ * 线程模型：主线程只负责 accept/recv/按 '\n' 取行，取到的每条消息深拷贝后
+ * 投递线程池（S2 起），业务解析在工作线程内完成；net_send 内部持发送锁，
+ * 因此**任何线程**都可以安全地用它回包。
  */
 #ifndef NET_H
 #define NET_H
