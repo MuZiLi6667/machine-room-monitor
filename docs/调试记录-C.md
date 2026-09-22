@@ -617,7 +617,7 @@ grep -c '\[ERROR\]' /tmp/s2.log      # → 0
 
 ---
 
-### 问题 22：valgrind 与 ThreadSanitizer 都不可用（缺 sudo 密码）
+### 问题 22：valgrind 装不上、ThreadSanitizer 链接失败 —— 最终免 root 跑通了 valgrind
 
 **现象**
 ```bash
@@ -625,27 +625,36 @@ $ which valgrind || echo 'valgrind 未安装'
 valgrind 未安装
 
 $ sudo -n true
-sudo: 需要密码                      ← 无免密，装不了
+sudo: 需要密码                      ← 无免密，apt install 走不通
 
-$ gcc -fsanitize=thread ... 
+$ gcc -fsanitize=thread ...
 /usr/bin/ld: 找不到 libtsan_preinit.o: 没有那个文件或目录
 ```
 
 **定位**
-`/usr/lib/gcc/x86_64-linux-gnu/9/` 下有 `libtsan.a`/`libtsan.so`（运行库在），**唯独缺 `libtsan_preinit.o`**；`-static-libtsan` 绕不过（链接器仍要该文件）；全盘 `find / -name libtsan_preinit.o` 无结果。
+1. TSan 路线：`/usr/lib/gcc/x86_64-linux-gnu/9/` 下有 `libtsan.a`/`libtsan.so`（运行库在），**唯独缺 `libtsan_preinit.o`**；`-static-libtsan` 也绕不过；`dpkg -L libgcc-9-dev` 显示该包**本来就不提供**这个文件（Ubuntu 20.04 的 gcc-9 包装配如此），全盘 `find` 亦无结果 —— 这条路彻底堵死。
+2. valgrind 路线：`apt-get download valgrind` **不需要 root**（只下载到当前目录），于是下载 + `dpkg-deb -x` 解包到 `/tmp/vg`，绕开安装。
 
 **原因**
-虚拟机未安装 valgrind；gcc-9 的 TSan 运行库不完整（包被裁剪），补齐需要 `sudo apt install`，而本机 sudo 有密码、执行 Agent 不持有。
+本机 sudo 有密码而执行 Agent 不持有，所以"装包"这类操作走不通；但"下载 deb + 解包"全程是普通用户权限，**不需要 sudo**。真正的障碍在后面：Debian 把 valgrind 的工具库放在非默认路径，直接运行解包出来的 `valgrind` 会报 `failed to start tool 'memcheck'`。
 
 **解决**
-规划里 S2-5 的 valgrind 项本就是"（可选）"，改用**免 root 的 AddressSanitizer** 覆盖同一类风险（S2 新增的任务 malloc/free 生命周期、cJSON 解析树释放），另用加重并发压测补偿做不到的竞争检测：
+定位到工具库的真实位置后用 `VALGRIND_LIB` 指过去，valgrind 即正常工作（无需安装、无需 root）：
+```bash
+mkdir -p /tmp/vgpkg && cd /tmp/vgpkg && apt-get download valgrind
+mkdir -p /tmp/vg && dpkg-deb -x valgrind_*.deb /tmp/vg
+find /tmp/vg -name 'memcheck-amd64-linux'      # → /tmp/vg/usr/lib/x86_64-linux-gnu/valgrind/
+export VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind
+/tmp/vg/usr/bin/valgrind --version             # → valgrind-3.15.0
+```
+> 注：`/tmp/vg/usr/bin/valgrind` 是个 shell wrapper，`--version` 在**没设** `VALGRIND_LIB` 时会失败（工具库找不到），设上即通。此后 helgrind/drd/memcheck 三个工具都可直接用。
+
+顺带保留 ASan 作为交叉验证手段（免 root、编译期开关，见上）：
 ```bash
 make CFLAGS='-Wall -Wextra -O1 -g -Isrc -fsanitize=address -fno-omit-frame-pointer'
 ./server_asan          # 官方 2×50 与加压 8×200 各跑一轮，最后 SIGINT 优雅退出
-grep -E 'ERROR: (Address|Leak)Sanitizer|SUMMARY|leaked' /tmp/asan.log
-# → 无任何报告（退出码正常，LSan 给出空报告）
+grep -E 'ERROR: (Address|Leak)Sanitizer|SUMMARY|leaked' /tmp/asan.log   # 无任何报告
 ```
-**遗留**：真正的数据竞争检测（TSan/helgrind）本阶段没能做。若 S7 压测前需要补，在本机执行一条 `sudo apt install valgrind` 即可。
 
 ---
 
@@ -669,9 +678,91 @@ sshd 要等会话内**所有**进程（包括刚 fork 出来的后台进程）�
 
 ---
 
+### 问题 24：Helgrind 抓到 cJSON 全局变量的数据竞争（**本阶段唯一的真实并发缺陷**）
+
+**现象**
+补上 valgrind 后，用 Helgrind 跑 S2-5 并发用例：
+```bash
+VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind \
+  /tmp/vg/usr/bin/valgrind --tool=helgrind --log-file=/tmp/hg.log ./server
+# 跑完 2×50 并发后：
+$ grep -c 'Possible data race' /tmp/hg.log
+2
+$ grep 'ERROR SUMMARY' /tmp/hg.log
+==5888== ERROR SUMMARY: 148 errors from 2 contexts (suppressed: 34127 from 59)
+```
+两条报告堆栈完全相同，都指向 cJSON：
+```
+Possible data race during write of size 8 at 0x195340 by thread #5
+   at 0x10D735: cJSON_ParseWithLengthOpts (cJSON.c:1110)
+   by 0x10F461: proto_handle (proto.c:121)
+   by 0x10AEE7: net_task_run (net.c:271)
+   by 0x10F09D: pool_worker (pool.c:58)
+   by 0x4864322: start_thread (pthread_create.c:477)
+This conflicts with a previous write of size 8 by thread #2   ← 同一个函数的另一个工作线程
+   ...（同样的堆栈）
+Address 0x195340 is 0 bytes inside data symbol "global_error"
+```
+
+**定位**
+- 写方是**两个不同的工作线程**，都停在 `cJSON.c:1110`（`global_error.json = NULL;`）与 `:1111`（`global_error.position = 0;`）；
+- 两条报告对应这个全局结构体的两个字段（地址 0x195340 与 0x195348，相差 8 字节）；
+- 看 cJSON 源码：`static error global_error = { NULL, 0 };` 是**进程级全局**，每次 `cJSON_Parse*` 进来都重置它，解析失败时（`fail:` 分支）还会写入错误位置；
+- 我们的 `proto_handle` 由 4 个工作线程并发调用，谁都没对这个全局加锁——**不是我们漏了锁，是这个全局本来就不该被多线程共享**。
+
+**原因**
+cJSON 的"最近一次解析错误"（`cJSON_GetErrorPtr` 的返回值来源）设计成进程级全局，隐含"单线程使用"的假设。本服务器把解析放进了线程池（S2 的核心改动），4 个工作线程同时解析，于是每次解析都在无锁地写同一个全局变量。虽然我们**从不调用** `cJSON_GetErrorPtr`、该值不会被读，但写-写竞争本身就是未定义行为，且会一直污染后续所有并发检测结果。
+
+**解决**
+给这个全局加 `__thread`，改为线程局部（与上游唯一差异，共 8 行，1 行代码 + 7 行注释）：
+```c
+-static error global_error = { NULL, 0 };
++static __thread error global_error = { NULL, 0 };
+```
+语义上更正确：每个线程各记各的最后一次解析错误，`cJSON_GetErrorPtr` 在多线程下才真正可用；单线程行为与上游完全一致。无需加锁，也不影响解析性能（线程局部反而免去了缓存行争用）。
+
+复测（同样的用例与加压）：
+```bash
+$ grep -c 'Possible data race' /tmp/hg2.log
+0
+$ grep 'ERROR SUMMARY' /tmp/hg2.log
+==6432== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 159562 from 59)
+```
+功能回归同步复跑：`basic` + `concurrent 50` + `concurrent 100 4` + `concurrent 200 8` 全部通过。
+
+> **给 S8 的提醒**：`src/cJSON.c` 现在带着这一处本地补丁（cJSON.h 未改）。**不要**再整份覆盖成上游版本，否则这个竞争会复活；差异可用 `diff /tmp/cJSON.c src/cJSON.c` 随时复核。
+
+---
+
+### 问题 25：Memcheck 报 `possibly lost: 1,152 bytes in 4 blocks`
+
+**现象**
+```bash
+$ VALGRIND_LIB=... valgrind --tool=memcheck --leak-check=full --show-leak-kinds=possible --log-file=/tmp/mc2.log ./server
+$ grep -A 12 'loss record' /tmp/mc2.log
+1,152 bytes in 4 blocks are possibly lost in loss record 1 of 1
+   at 0x483DD99: calloc (...)
+   by 0x40149DA: allocate_dtv (dl-tls.c:286)
+   by 0x40149DA: _dl_allocate_tls (dl-tls.c:532)
+   by 0x4864322: allocate_stack (allocatestack.c:622)
+   by 0x4864322: pthread_create@@GLIBC_2.2.5 (pthread_create.c:660)
+   by 0x10F103: pool_init (pool.c:80)
+   by 0x10A6CB: main (main.c:52)
+```
+`definitely lost: 0`、`indirectly lost: 0`、`still reachable: 0`，只有这 4 块。
+
+**定位**
+堆栈直指 `pool_init` 里的 `pthread_create`，再往下是 glibc 的 `_dl_allocate_tls`——分配的是**每个线程的 TLS/线程描述符**。块数 4 恰等于 `POOL_THREADS`，大小 288 字节/块。
+
+**原因**
+这 4 个工作线程按设计**常驻到进程结束**（`pool.h` 写明"线程随进程退出，没有销毁接口"），进程退出时它们仍在运行，Valgrind 无法通过寄存器/栈找到指向这些块的唯一指针，于是归类为 `possibly lost`。**不是内存泄漏**，是活跃线程的正常开销。
+
+**解决**
+无需处理（若强行消除，就得给线程池加一套 shutdown/join 机制，属于规划未要求的复杂度）。本条记录在案，是为了让 S7 复跑压测时能一眼认出这条报告、不至于误判为新泄漏——**判读标准：只要 `definitely lost` 为 0 就没有泄漏**。
+
 ## 九、S2 验收结论
 
-**产出**：新增 `src/pool.c/h`（线程池）、`src/proto.c/h`（cJSON 解析与分发）、`src/cJSON.c/h`（官方 v1.7.18，cJSON.c MD5 `630deb131a520d63b8913492d982b589`、cJSON.h MD5 `a9c6c607caeee91e5fe70dfd349b4ddc`，与上游逐字节一致）；改动 `net.c`（echo 占位 → 深拷贝投递线程池、`net_send` 加发送锁、accept 设 `SO_SNDTIMEO`）、`session.c`（会话表锁）、`main.c`（`pool_init`）、`config.h`（新增 `SEND_TIMEOUT_SEC`）。`make clean && make` 零警告零错误（含 cJSON.c）。
+**产出**：新增 `src/pool.c/h`（线程池）、`src/proto.c/h`（cJSON 解析与分发）、`src/cJSON.c/h`（官方 v1.7.18：cJSON.h 与上游逐字节一致，MD5 `a9c6c607caeee91e5fe70dfd349b4ddc`；cJSON.c 基于上游 MD5 `630deb131a520d63b8913492d982b589`，带一处 8 行本地补丁——`global_error` 加 `__thread`，见问题 24）；改动 `net.c`（echo 占位 → 深拷贝投递线程池、`net_send` 加发送锁、accept 设 `SO_SNDTIMEO`）、`session.c`（会话表锁）、`main.c`（`pool_init`）、`config.h`（新增 `SEND_TIMEOUT_SEC`）。`make clean && make` 零警告零错误（含 cJSON.c）。
 
 **验收命令与实测输出**
 
@@ -688,7 +779,9 @@ sshd 要等会话内**所有**进程（包括刚 fork 出来的后台进程）�
 | 检查 | 结果 |
 |---|---|
 | 加压并发：`python s2_probe.py concurrent 200 8`（8 客户端 × 200 条 = 1600 条） | ✅ 8 个客户端全部 200/200 条回包正确，无串包、无交错 |
-| AddressSanitizer + LeakSanitizer（替代不可用的 valgrind，见问题 22） | ✅ 走完官方 2×50 与加压 8×200 后 SIGINT 优雅退出，**无任何 ASan/LSan 报告** |
+| **数据竞争检测（S2-5 点名的 valgrind 项）**<br>`VALGRIND_LIB=… valgrind --tool=helgrind ./server` 跑完 basic + 2×50 + 4×100 + 8×200 | ✅ `grep -c 'Possible data race'` = **0**；`ERROR SUMMARY: 0 errors from 0 contexts`。<br>修复前为 **2 个上下文 / 148 次**（cJSON 全局 `global_error`，已用 `__thread` 修掉，见问题 24） |
+| **内存泄漏检测**<br>`valgrind --tool=memcheck --leak-check=full ./server` | ✅ `definitely lost: 0`、`indirectly lost: 0`、`still reachable: 0`；仅 `possibly lost: 1,152 bytes in 4 blocks` —— 4 个常驻工作线程的 TLS 块，非泄漏（见问题 25） |
+| AddressSanitizer + LeakSanitizer（免 root 的交叉验证，见问题 22） | ✅ 走完官方 2×50 与加压 8×200 后 SIGINT 优雅退出，**无任何 ASan/LSan 报告** |
 | 服务器错误日志 | ✅ `grep -c '\[ERROR\]' /tmp/s2.log` = **0**；108 条 WARN 恰好对应 108 条非法输入消息 |
 | 退出行为回归（S0-6/S1） | ✅ SIGINT 后依次打印"select 主循环已退出"→"收到退出信号，服务器正常退出"，端口 9000 释放 |
 
@@ -702,5 +795,6 @@ sshd 要等会话内**所有**进程（包括刚 fork 出来的后台进程）�
 4. **锁序：会话表锁 → 发送锁**，任何路径不得反向。工作线程执行任务时**不持有池锁**（`pool.c` 在调用 `task.fn` 前已解锁），因此任务体里可以安全地调 `net_send` / `session_*`，甚至可以再 `pool_submit` 而不会自死锁。
 5. **`pool_submit` 队列满时阻塞**（背压），不丢任务。S4 起任务体里会有 MySQL 查询，单条变慢会通过背压顶住主线程；那时应关注任务队列水位。
 6. **S3 注意 `session_client_id` 的指针生命周期**：该函数返回的是**会话槽内部指针**，`session.c` 加锁后，出锁那一刻它就可能因连接被踢/回收而失效。S3 实现时应在锁内 `memcpy` 到调用方缓冲（或改由调用方一次性取走所需字段），不要把裸指针传出后再用。
-7. **cJSON 要点**：`cJSON_PrintUnformatted` 得到的字符串要用 `cJSON_free` 释放；`cJSON_Parse` 失败返回 NULL，此时**没有**对象可释放（不要对 NULL 调 `cJSON_Delete`）；`cJSON_AddNumberToObject(obj, "code", 1)` 输出的是 `1` 而非 `1.0`（S2-1~S2-3 已逐字节比对）。
+7. **cJSON 要点**：`cJSON_PrintUnformatted` 得到的字符串要用 `cJSON_free` 释放；`cJSON_Parse` 失败返回 NULL，此时**没有**对象可释放（不要对 NULL 调 `cJSON_Delete`）；`cJSON_AddNumberToObject(obj, "code", 1)` 输出的是 `1` 而非 `1.0`（S2-1~S2-3 已逐字节比对）。**`src/cJSON.c` 带一处本地补丁（`global_error` 加 `__thread`，见问题 24），不要再从上游整份覆盖**。
 8. **日志的 `[tid:…]` 是 S2-4 的证据来源**：新增模块请继续用 `log_info/log_warn/log_err`，不要直接 `printf`——否则会丢线程号，且多线程下可能交错。
+9. **并发检测的做法（S7 直接复用）**：虚拟机没装 valgrind 也能跑——`apt-get download valgrind` + `dpkg-deb -x` 解包到 `/tmp/vg`，再用 `VALGRIND_LIB=/tmp/vg/usr/lib/x86_64-linux-gnu/valgrind` 启动（见问题 22）。S7 压测建议照此跑一轮 `--tool=helgrind`（盯 `Possible data race`）与一轮 `--tool=memcheck --leak-check=full`（**只认 `definitely lost`，`possibly lost` 里那 1152 字节是常驻线程的 TLS，不是泄漏**）。

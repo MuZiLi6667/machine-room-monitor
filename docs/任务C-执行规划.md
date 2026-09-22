@@ -211,6 +211,8 @@ void *analysis_thread(void *arg);              /* 每60s：db_run_analysis + 推
 
 **产出**：`src/pool.c/h`、`src/proto.c/h`、`src/cJSON.c/h`，echo 逻辑移除。
 
+> 实现记录：`src/cJSON.c` 保留了**一处 8 行本地补丁**——把上游的进程级全局 `global_error` 改成 `__thread`。原因见 `docs/调试记录-C.md` 问题 24（Helgrind 实测：4 个工作线程并发解析时对该全局产生数据竞争）。**后续不要再从上游整份覆盖 cJSON.c**，否则竞争会复活。
+
 **验收标准**：
 | # | 输入（经 nc 或 probe） | 预期 |
 |---|---|---|
