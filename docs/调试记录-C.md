@@ -931,3 +931,112 @@ Command did not complete within its 240s timeout and was moved to the background
 6. **未登录拦截的三个入口已就位**：DATA/HEARTBEAT 在各自 handler 开头判 `session_is_logged(fd)`，未登录回 `code=3` 且**不 touch 活跃时间**（`session_touch` 在判定之后调用）。S4/S5 新增的消息类型同样要先过这道判定。
 7. **刷新活跃时间有两处**：`net.c` 在 recv 到字节时无条件 `session_touch`（"任何字节到达即活跃"的兜底），proto 在处理**合法且已登录**的消息时再显式 touch 一次（对齐规划 S3 任务 4 的表述）。重复 touch 无害，静置场景（S3-5）不受影响。
 8. **验收脚本要"收到即返回"**：本轮压测脚本因"每轮等满超时"把 60 轮拖到 250s（问题 28）。S7 压测请用"收到数据即返回"的读法，超时只作为"没有应答"的判据。
+
+---
+
+## 十四、S4 阶段问题记录（DATA 入库）
+
+### 问题 29：`strptime` 隐式声明——返回的指针被当成 `int` 截断
+
+**现象**
+新增 ts 校验后 `make` 出现两条警告（S4 首次编译）：
+
+```
+src/proto.c: In function ‘proto_datetime_ok’:
+src/proto.c:164:12: warning: implicit declaration of function ‘strptime’; did you mean ‘strftime’? [-Wimplicit-function-declaration]
+  164 |     rest = strptime(ts->valuestring, "%Y-%m-%d %H:%M:%S", &tmv);
+src/proto.c:164:10: warning: assignment to ‘const char *’ from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
+```
+
+**定位**
+`strptime` 是 X/Open（XSI）扩展，不在 C 标准与 POSIX 基础集里；glibc 只在定义了 `_XOPEN_SOURCE` 时才在 `<time.h>` 里声明它。本工程 Makefile 用 gcc 默认的 `-std=gnu17`（`_DEFAULT_SOURCE`），恰好不含这一项，于是编译器"没见过"这个函数，按 C89 老规矩当作返回 `int` 的函数放行。
+
+**原因**
+隐式声明的返回类型是 `int`，而 `strptime` 实际返回 `char *`——指向**未解析部分**的指针。64 位机上指针被截成低 32 位，再拿去做 `*rest != '\0'` 的判断属于未定义行为；即使侥幸不崩，也会把合法 ts 判成非法（一律回落到 NOW()），S4-3/S4-4 的判定口径就整体失效。这条警告不是"风格提示"，它本身就是 UB 报告。
+
+**解决**
+在 `proto.c` **任何 `#include` 之前**加一行：
+
+```c
+#define _XOPEN_SOURCE 700   /* strptime() 属于 XSI 扩展，glibc 默认不声明 */
+```
+
+重编后零警告零错误。经验：特性宏只在用到它的那个 `.c` 顶部定义，不要塞进 Makefile 的 `CFLAGS`——那会影响全部源文件（例如 `_XOPEN_SOURCE` 会关掉 `__USE_MISC`，可能让别处依赖的 BSD 扩展消失）。
+
+### 问题 30：`timeout 30 python probe.py > 文件` 拿到空文件——S4-2 的比对证据被缓冲吞了
+
+**现象**
+S4-1 跑完（行数 0 → 64，增长正确），但为 S4-2 准备的"probe 自己发出去的记录"文件是空的，`tail -2` 无任何输出。
+
+**定位**
+命令是 `timeout 30 python simulator/server_probe.py client ... > s4_probe_out.txt`。probe 用 `print` 输出到 stdout：**stdout 是终端时是行缓冲**（所以 S3 手测从没遇到过），**一旦重定向到文件就变成块缓冲**（4~8KB）。30 秒的 16 条记录还填不满一个缓冲块，全留在用户态缓冲里；`timeout` 到点发 SIGTERM 直接杀进程，缓冲随之丢弃。
+
+**原因**
+与问题 28 同类——**证据的采集方式不严谨，会得出与事实相反的结论**：数据其实已经正确入库（服务器日志与 SQL 都能证明），但"发送侧原始记录"没落盘，S4-2 就无法做逐值比对。
+
+**解决**
+凡是重定向抓输出，一律加 `-u`（无缓冲）：`timeout 11 python -u simulator/server_probe.py ... > s4_probe_pc02.txt`。重跑后 probe 记录的
+`[-> #6] {"type": "DATA", "ts": "2026-09-22 18:33:14", "sensors": [{"id": 1, "v": 30.1}, {"id": 2, "v": 66.1}, {"id": 3, "v": 184}, {"id": 4, "v": 384}]}`
+与库中 id 85~88 行逐值对上（见 §十五 S4-2）。
+
+### 问题 31：虚拟机时钟比宿主机快约 2 秒（吃掉联调点 §6.5"误差<3s"的大半余量）
+
+**现象**
+用宿主机时间给 probe 的输出打点、用 MySQL 的 `NOW()` 给服务器侧打点，同一动作的两串时间对不上，差 2~3 秒。
+
+**定位**
+单次往返测量（两端各记宿主机时刻，取中点作为虚拟机采样时刻）：
+
+```
+宿主机 发起=1790073232.008870600 返回=1790073232.709718200
+虚拟机 时刻=2026-09-22 18:33:54.382315386
+→ 单程约 0.35 s；虚拟机时钟 - 宿主机时钟 ≈ +2.02 s
+```
+
+同一时刻虚拟机的 `date` 与 MySQL 的 `NOW()` 完全一致（都是 18:33:46），说明偏差在**宿主机 ↔ 虚拟机**之间，不在 MySQL。
+
+**原因**
+虚拟机时间同步（VMware Tools / chrony）在上电后未及时校正，宿主机与客户机各自走时钟。属环境问题，不是代码问题。
+
+**解决**
+不修代码。判读口径改为**同一侧时钟内部比对**：S4-3/S4-4 的"collect_time ≈ 服务器当前时间"用服务器日志时间戳（服务器侧时钟）与该行 collect_time 比（实测同一秒，误差 ≤1s），不掺宿主机时间。记录在案是因为它直接关系接口规范 §6.5「三端时间戳一致，误差 < 3s」——2s 的系统性偏差仍在容差内，但已占掉大半余量，联调时若发现时间戳成片偏移，先查这里；建议联调前在虚拟机执行 `sudo timedatectl set-ntp true`（或手工校准）后再测。
+
+---
+
+## 十五、S4 验收结论
+
+**产出**：新增 `src/db.c` / `src/db.h`（每线程一条 MySQL 连接的惰性建连、`db_insert_sensor` 转义+写入、`db_shutdown`）；改动 `proto.c`（DATA 分支拆包入库、`proto_datetime_ok` 校验 ts）、`main.c`（`db_init` 排在 `pool_init` 之前、退出前 `db_shutdown`、版本行）。`make clean && make` **零警告零错误**。**接口规范 §3.1/§3.2/§4 字段零改动**（DATA 依然不回包，也没有提前实现 S5 的告警）。
+
+**验收命令与实测输出**（同一台服务器、一份连续日志 `/tmp/s4.log`，库中原有 0 行）
+
+| # | 命令 | 预期 | 实际 |
+|---|---|---|---|
+| S4-1 | ① `mysql -uiot -piot123456 machine_room -e 'SELECT COUNT(*) FROM sensor_data;'`<br>② `PYTHONIOENCODING=utf-8 timeout 30 python simulator/server_probe.py client -H 10.202.57.4 --id PC-01`<br>③ 再查一次 COUNT | 持续增长，约每 2s 增 4 行 | ✅ 跑前 **0**、跑后 **64**（16 条 DATA × 4 传感器，30 秒 2s 一条）。前 8 行 `collect_time` = 18:32:21×4 → 18:32:23×4，正是"每 2 秒 4 行" |
+| S4-2 | probe（PC-02，`python -u` 留发送记录）+ `SELECT * FROM sensor_data WHERE client_id='PC-02' ORDER BY id DESC LIMIT 4;` | 数值与 probe 发送一致 | ✅ probe 最后一条发出的原文：`{"id": 1, "v": 30.1}, {"id": 2, "v": 66.1}, {"id": 3, "v": 184}, {"id": 4, "v": 384}`，ts=18:33:14；库中 id 85~88 为 `30.10 / 66.10 / 184.00 / 384.00`，collect_time 全为 `2026-09-22 18:33:14` —— 4 个值逐一对上（温度湿度 1 位小数、烟雾光照整数） |
+| S4-3 | 手工发 `{"type":"DATA","sensors":[{"id":1,"v":23.4}]}`（无 ts） | 该行 collect_time ≈ 服务器当前时间（误差<3s） | ✅ 日志 `[2026-09-22 18:33:27] … ts=(缺省，用服务器 NOW()) 入库 1/1 行`；库中 id=89 `sensor_value=23.40, collect_time=2026-09-22 18:33:27` —— 与服务器日志同一秒（误差 ≤1s） |
+| S4-4 | 手工发 `{"type":"DATA","ts":"not-a-time","sensors":[{"id":2,"v":48.8}]}` | 不报错，fallback 到 NOW() | ✅ 日志 `[2026-09-22 18:33:27] … ts=(非法，改用服务器 NOW()) 入库 1/1 行`；库中 id=90 `48.80 / 2026-09-22 18:33:27`；全程 `[ERROR]` 0 条、连接未断（随后继续发消息仍被处理） |
+| S4-5 | 手工发 `{"id":3,"v":25}`（int）与 `{"id":4,"v":25.6}`（float） | 两种都正确入库 | ✅ 库中 id=91 `sensor_type=3, sensor_value=25.00`、id=92 `sensor_type=4, sensor_value=25.60` —— int 与 float 都落库，DECIMAL(10,2) 按列定义补足两位小数 |
+
+**附加验证（超出验收标准的部分）**
+
+| 检查 | 结果 |
+|---|---|
+| **"每线程一条连接"的直接证据**（规划 S4 任务 1 的设计要点） | ✅ 服务器日志里 `本线程已建立 MySQL 连接` 共 **5 条、tid 各不相同**：主线程 `140462175754112`（与启动横幅同一个 tid）+ 4 个工作线程；跑 probe 期间查 `information_schema.processlist`，`user='iot'` 对 `machine_room` 的连接恰好 **5 条**（另 1 条是我自己的查询会话，db 为 NULL） |
+| 日志计数与库中行数交叉核对 | ✅ 日志累计"入库 N 行"求和 = **204**，与 `SELECT COUNT(*)` = **204** 完全一致；分组 `PC-01 68 / PC-02 24 / PC-03 56 / PC-04 56`（4 个 client_id 并发写入互不串） |
+| 容错：越界 id 与非数值 v | ✅ `{"id":7,…},{"id":1,"v":"x"}` → 两条 WARN（`id=7 不是 1~4 的整数`、`id/v 缺失或非数值`），日志 `入库 0/2 行（跳过 2）`，该连接后续消息不受影响 |
+| **DATA 不回任何包**（接口规范 §3.1 未定义应答） | ✅ 一条连接上连发 5 条 DATA 后静置 2s，回包列表为空（仅 LOGIN 时回过一条 LOGIN_ACK） |
+| 服务器错误日志 | ✅ 连续日志 `[ERROR]` = **0**；6 条 WARN = 4 条 `recv() 失败 … Connection reset by peer`（**是 `timeout` 杀 probe 产生 RST 的正常现象**，不是缺陷）+ 2 条上面的容错跳过 |
+| 优雅退出回归（S0-6/S1~S3） | ✅ SIGINT 后依次打印 `select 主循环已退出` → `数据库连接已关闭（mysql_library_end 已调用）` → `收到退出信号，服务器正常退出`，端口 9000 释放、无残留进程 |
+
+---
+
+## 十六、S4 实现要点（供 S5/S6 参考，避免踩坑）
+
+1. **`db_init` 必须在线程创建之前**（main.c 里排在 `pool_init` 前面）：`mysql_library_init()` 不是线程安全的；工作线程读到的连接参数靠 `pthread_create` 建立的 happens-before 保证可见，之后参数只读、无需加锁。
+2. **每线程一条连接是惰性建立的**（`__thread MYSQL *t_conn` + 首次使用时 `mysql_thread_init`）。S6 的分析线程要写库，直接调 `db_*` 即可——那条线程首次调用时会自己建连，**不要**把主线程的连接对象传过去。
+3. `db_exec()`（db.c 内的 static）带"连接断开（2006/2013）→ 重连一次重试"的兜底。S5 的 `db_insert_alarm`、S6 的 `db_run_analysis` 请复用它，不要再各写一遍 `mysql_query`。
+4. **DATA 分支"不回包"在 S4 依然成立**。S5 加告警时，只允许新增 `ALARM` 推送（那是接口规范 §3.1 定义的服务器主动消息），**不要**顺手给 DATA 加个 ACK。
+5. ts 的两道校验（`strptime` 整串消费 + `mktime/strftime` 往返比对）是**客户端输入专用**的，写在 proto.c 内部的 static 函数里；S5 组装 ALARM 的 `ts`、S6 的 `period_start/period_end` 都是服务器自己生成的时间，直接 `strftime` 即可，不要绕道这个函数。
+6. 一条 DATA = 4 次 `mysql_query` 往返，2 秒周期余量充足。S6 的聚合查询若变慢，先看任务队列水位（§十 要点 5 的背压：`pool_submit` 队列满会顶住主线程）。
+7. 本步**未跑** helgrind / memcheck（规划里属 S7）。已知形态供 S7 判读：4 个工作线程常驻不退出，它们的连接与 TLS 在进程退出时表现为 `still reachable`——判读标准仍按 §九：**只看 `definitely lost` 是否为 0**。
+8. 抓 Python probe 的输出做证据时记得 `-u`（问题 30）；重定向 + 被杀 = 缓冲丢失，会得到"空文件"这种假证据。

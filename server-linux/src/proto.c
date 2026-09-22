@@ -1,12 +1,12 @@
 /*
- * proto.c —— cJSON 解析与按 type 分发（S2 实现，S3 填会话业务）
+ * proto.c —— cJSON 解析与按 type 分发（S2 实现，S3 填会话业务，S4 接 DATA 入库）
  *
  * 处理流程（接口规范 §3.2 容错约定）：
  *   cJSON_Parse 失败            → ERROR code=1 "malformed json"
  *   type 缺失 / 非字符串 / 未知 → ERROR code=2 "unknown type"
  *   LOGIN                       → 注册 client_id（含踢旧）→ LOGIN_ACK status=0（S3）
  *   HEARTBEAT                   → HEARTBEAT_ACK（S3）
- *   DATA                        → S3 只记录；S4 起入库并触发告警
+ *   DATA                        → 拆 sensors[] 逐条写 sensor_data（S4），**不回包**
  * 所有 ERROR 都只应答、不主动断开（S2-1~S2-3、S3-6）。
  *
  * 登录态拦截（S3）：DATA/HEARTBEAT 若在 LOGIN 之前到达 → ERROR code=3
@@ -15,16 +15,27 @@
  * 本文件跑在工作线程里：不碰会话表内部结构，一律走 session_* 与 net_send
  * 这两个线程安全接口；跨模块传递的 client_id 用 session_client_id_copy
  * 拷贝到本地缓冲，避免裸指针出锁失效（调试记录 §十 要点 6）。
+ * 写库走 db_*（db 模块每线程一条连接，工作线程直接调即可，无需额外加锁）。
  */
+
+/* strptime() 属于 X/Open（XSI）扩展，glibc 只在 _XOPEN_SOURCE 下声明它——
+ * 不定义就只剩隐式声明，返回值（指针）会被当成 int 截断，且 -Wall 报警告。
+ * 必须在任何 #include 之前定义（S4 实测）。 */
+#define _XOPEN_SOURCE 700
+
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "config.h"
+#include "db.h"
 #include "log.h"
 #include "net.h"
 #include "proto.h"
 #include "session.h"
+
+#define DATETIME_STR_LEN 19          /* "YYYY-MM-DD HH:MM:SS" 恰好 19 字符 */
 
 /* 错误码：1/2 由接口规范 §3.1 定义；3/4 是规范未定义路径上的自定义码
  * （规划 S3 任务 1、2 允许"自定义码即可"），语义见注释，不改规范字段。 */
@@ -38,6 +49,7 @@ static void proto_reply_error(int fd, int code, const char *msg);
 static void proto_handle_login(int fd, const cJSON *msg);
 static void proto_handle_data(int fd, const cJSON *msg);
 static void proto_handle_heartbeat(int fd, const cJSON *msg);
+static int  proto_datetime_ok(const cJSON *ts, char *out, size_t cap);
 
 /* 统一回包：组 JSON 文本 + 补分帧符 '\n' + net_send（规划 S2 任务 4）。
  * 分帧符必须和 JSON 文本在**同一次** net_send 内发出：拆成两次调用会被其他
@@ -131,8 +143,59 @@ static void proto_handle_login(int fd, const cJSON *msg)
 }
 
 /*
- * DATA（S3）：登录态拦截 + 记录；**本分支任何情况下都不回包**
- * （接口规范 §3.1 未给 DATA 定义应答，S3 也不提前实现 S4 的入库）。
+ * ts 合法性判定（S4-3 / S4-4）：接口规范 §3.2 规定 ts 为 "%Y-%m-%d %H:%M:%S"
+ * 且**可缺省**——缺省或非法时服务器用自身当前时间入库（SQL 的 NOW()）。
+ * 这里做两道校验：
+ *   ① strptime 按规范格式串逐字段解析，并要求整串被消费完：
+ *      "not-a-time"、"2026-09-28 15:00:01xyz" 都在这一步被拒；
+ *   ② mktime 归一化后再 strftime 回同一格式串，要求与输入逐字节相同：
+ *      专拦"格式对但日期不存在"的输入（如 2 月 31 日会被归一化成 3 月 3 日）。
+ *      不做这道检查的话，这种 ts 会原样拼进 SQL，在 MySQL 严格模式下报错、
+ *      白丢一行数据。
+ * 合法 → 拷进 out（供入库使用）并返回 1；缺省/非法 → 返回 0（调用方落 NOW()）。
+ */
+static int proto_datetime_ok(const cJSON *ts, char *out, size_t cap)
+{
+    struct tm   tmv;
+    char        norm[DATETIME_STR_LEN + 1];
+    const char *rest;
+    time_t      t;
+
+    if (!cJSON_IsString(ts) || ts->valuestring == NULL) {
+        return 0;
+    }
+
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_isdst = -1;                 /* 夏令时未知，交给 mktime 判断 */
+    rest = strptime(ts->valuestring, "%Y-%m-%d %H:%M:%S", &tmv);
+    if (rest == NULL || *rest != '\0') {
+        return 0;
+    }
+
+    t = mktime(&tmv);                  /* 就地归一化 tmv */
+    if (t == (time_t)-1) {
+        return 0;
+    }
+    if (strftime(norm, sizeof(norm), "%Y-%m-%d %H:%M:%S", &tmv) == 0 ||
+        strcmp(norm, ts->valuestring) != 0) {
+        return 0;
+    }
+
+    snprintf(out, cap, "%s", ts->valuestring);
+    return 1;
+}
+
+/*
+ * DATA（S4）：登录态拦截 → 拆 sensors[] 逐条写 sensor_data → 记日志。
+ *
+ * **本分支任何情况下都不回包**：接口规范 §3.1 没有为 DATA 定义应答，
+ * 客户端也不等应答（调试记录 §十三 要点 5）——入库成功与否都不该往连接上
+ * 写东西，否则客户端会把它当成未知的服务器主动消息。
+ *
+ * 容错口径（接口规范 §3.2：id 限 1~4、v 收 int 或 float）：
+ *   单条 sensor 的 id/v 缺失、非数值、id 非整数或超出 1~4 → 跳过该条并记 WARN，
+ *   其余条目照常入库；一条 DATA 里的坏数据不影响同批的好数据。
+ *   整批 sensors 不是数组 → 整条丢弃（记 WARN）。
  */
 static void proto_handle_data(int fd, const cJSON *msg)
 {
@@ -140,9 +203,14 @@ static void proto_handle_data(int fd, const cJSON *msg)
     const cJSON *ts;
     const cJSON *it;
     char         cid[CLIENT_ID_MAX_LEN + 1];
+    char         tsbuf[DATETIME_STR_LEN + 1];
+    const char  *ts_use  = NULL;       /* NULL → 入库时用 SQL 的 NOW() */
+    const char  *ts_show;
     char         vals[256];
     size_t       used = 0;
-    int          n    = 0;
+    int          total = 0;
+    int          ins   = 0;
+    int          skip  = 0;
 
     if (!session_is_logged(fd)) {
         log_warn("fd=%d 未登录就发 DATA，回 ERROR code=%d（连接保持）",
@@ -152,39 +220,73 @@ static void proto_handle_data(int fd, const cJSON *msg)
     }
     session_touch(fd);                 /* 合法消息刷新活跃时间（规划 S3 任务 4） */
 
+    /* 入库要用的 client_id 必须是锁内拷出来的本地副本：session_client_id()
+     * 返回的是会话槽内部指针，出锁即可能因连接被踢/回收而失效
+     * （调试记录 §十 要点 6、§十三 要点 4）。 */
     if (session_client_id_copy(fd, cid, (int)sizeof(cid)) < 0) {
         cid[0] = '\0';                 /* 理论上不会发生（上面刚判过登录态） */
     }
-    ts = cJSON_GetObjectItemCaseSensitive(msg, "ts");
 
-    /* 按 [1=25.6 2=55 3=312 4=356] 的形式汇总，便于 S3-2 肉眼核对 4 个值。
-     * 字段缺失/类型不对只跳过该条，不作协议错误处理（容错规则见 S4）。 */
+    ts = cJSON_GetObjectItemCaseSensitive(msg, "ts");
+    if (proto_datetime_ok(ts, tsbuf, sizeof(tsbuf))) {
+        ts_use  = tsbuf;
+        ts_show = tsbuf;
+    } else {
+        ts_show = (ts != NULL) ? "(非法，改用服务器 NOW())"
+                               : "(缺省，用服务器 NOW())";
+    }
+
     vals[0] = '\0';
     sensors = cJSON_GetObjectItemCaseSensitive(msg, "sensors");
-    if (cJSON_IsArray(sensors)) {
-        cJSON_ArrayForEach(it, sensors) {
-            const cJSON *id = cJSON_GetObjectItemCaseSensitive(it, "id");
-            const cJSON *v  = cJSON_GetObjectItemCaseSensitive(it, "v");
-            int          w;
+    if (!cJSON_IsArray(sensors)) {
+        log_warn("fd=%d client_id=%s DATA 的 sensors 不是数组，本条整条丢弃（未入库）",
+                 fd, cid);
+        return;
+    }
 
-            n++;
-            if (!cJSON_IsNumber(id) || !cJSON_IsNumber(v) ||
-                used >= sizeof(vals) - 1) {
-                continue;
-            }
+    cJSON_ArrayForEach(it, sensors) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(it, "id");
+        const cJSON *v  = cJSON_GetObjectItemCaseSensitive(it, "v");
+        int          sid;
+        int          w;
+
+        total++;
+
+        if (!cJSON_IsNumber(id) || !cJSON_IsNumber(v)) {
+            skip++;
+            log_warn("fd=%d client_id=%s DATA 跳过一条：id/v 缺失或非数值", fd, cid);
+            continue;
+        }
+        sid = (int)id->valuedouble;
+        if ((double)sid != id->valuedouble ||
+            sid < SENSOR_ID_MIN || sid > SENSOR_ID_MAX) {
+            skip++;
+            log_warn("fd=%d client_id=%s DATA 跳过一条：id=%g 不是 %d~%d 的整数",
+                     fd, cid, id->valuedouble, SENSOR_ID_MIN, SENSOR_ID_MAX);
+            continue;
+        }
+
+        /* 一个传感器值一行；v 是 int 还是 float 都走同一条路（cJSON 一律按
+         * double 取出），由 DECIMAL(10,2) 落库 */
+        if (db_insert_sensor(cid, sid, v->valuedouble, ts_use) == 0) {
+            ins++;
+        } else {
+            skip++;                    /* db 内已记 ERROR 日志 */
+        }
+
+        /* 汇总成 [1=25.6 2=55 3=312 4=356]，与 S3-2 的日志格式一致，
+         * 便于和 SELECT 出来的行逐值核对（S4-2） */
+        if (used < sizeof(vals) - 1) {
             w = snprintf(vals + used, sizeof(vals) - used, "%s%d=%g",
-                         (used > 0) ? " " : "",
-                         (int)id->valuedouble, v->valuedouble);
+                         (used > 0) ? " " : "", sid, v->valuedouble);
             if (w > 0) {
                 used += (size_t)w;
             }
         }
     }
 
-    log_info("fd=%d client_id=%s DATA：ts=%.31s sensors=%d [%s]（S3 仅记录，S4 起入库）",
-             fd, cid,
-             (cJSON_IsString(ts) && ts->valuestring != NULL) ? ts->valuestring : "(缺省)",
-             n, vals);
+    log_info("fd=%d client_id=%s DATA：ts=%s 入库 %d/%d 行（跳过 %d）[%s]",
+             fd, cid, ts_show, ins, total, skip, vals);
 }
 
 /*
