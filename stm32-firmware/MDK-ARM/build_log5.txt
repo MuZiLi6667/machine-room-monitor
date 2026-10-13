@@ -1,0 +1,11 @@
+Build target 'machine-room-monitor'
+compiling main.c...
+..\User\main.c(129): warning:  #177-D: function "bh1750_diag" was declared but never referenced
+  static void bh1750_diag(void)
+..\User\main.c(217): warning:  #177-D: function "bh1750_diag2" was declared but never referenced
+  static void bh1750_diag2(void)
+..\User\main.c: 2 warnings, 0 errors
+linking...
+Program Size: Code=11204 RO-data=268 RW-data=44 ZI-data=1636  
+FromELF: creating hex file...
+".\Objects\machine-room-monitor.axf" - 0 Error(s), 2 Warning(s).

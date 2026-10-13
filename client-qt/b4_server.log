@@ -1,0 +1,71 @@
+[b4-server] listening on 0.0.0.0:9000
+[+] client connected from ('127.0.0.1', 56863)
+[LOGIN] AUTO-CLIENT
+[DATA #1] 4 sensors
+[DATA #2] 4 sensors
+[DATA #3] 4 sensors
+[->] ANALYSIS pushed
+[DATA #4] 4 sensors
+[DATA #5] 4 sensors
+[->] ALARM HIGH pushed
+[DATA #6] 4 sensors
+[->] ANALYSIS pushed
+[DATA #7] 4 sensors
+[DATA #8] 4 sensors
+[DATA #9] 4 sensors
+[->] ANALYSIS pushed
+[DATA #10] 4 sensors
+[->] ALARM WARN pushed
+[DATA #11] 4 sensors
+[DATA #12] 4 sensors
+[->] ANALYSIS pushed
+[DATA #13] 4 sensors
+[DATA #14] 4 sensors
+[DATA #15] 4 sensors
+[->] ANALYSIS pushed
+[->] ALARM HIGH pushed
+[HEARTBEAT] -> ACK
+[DATA #16] 4 sensors
+[DATA #17] 4 sensors
+[DATA #18] 4 sensors
+[->] ANALYSIS pushed
+[DATA #19] 4 sensors
+[DATA #20] 4 sensors
+[->] ALARM WARN pushed
+[b4-server] listening on 0.0.0.0:9000
+[+] client connected from ('127.0.0.1', 56906)
+[LOGIN] AUTO-CLIENT
+[DATA #1] 4 sensors
+[DATA #2] 4 sensors
+[DATA #3] 4 sensors
+[->] ANALYSIS pushed
+[DATA #4] 4 sensors
+[DATA #5] 4 sensors
+[->] ALARM HIGH pushed
+[DATA #6] 4 sensors
+[->] ANALYSIS pushed
+[DATA #7] 4 sensors
+[DATA #8] 4 sensors
+[DATA #9] 4 sensors
+[->] ANALYSIS pushed
+[DATA #10] 4 sensors
+[->] ALARM WARN pushed
+[DATA #11] 4 sensors
+[DATA #12] 4 sensors
+[->] ANALYSIS pushed
+[DATA #13] 4 sensors
+[DATA #14] 4 sensors
+[DATA #15] 4 sensors
+[->] ANALYSIS pushed
+[->] ALARM HIGH pushed
+[HEARTBEAT] -> ACK
+[DATA #16] 4 sensors
+[DATA #17] 4 sensors
+[DATA #18] 4 sensors
+[->] ANALYSIS pushed
+[DATA #19] 4 sensors
+[DATA #20] 4 sensors
+[->] ALARM WARN pushed
+[DATA #21] 4 sensors
+[->] ANALYSIS pushed
+[-] client disconnected, waiting for reconnect...

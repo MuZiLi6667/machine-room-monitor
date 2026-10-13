@@ -1,0 +1,35 @@
+[b4-server] listening on 0.0.0.0:9001
+[+] client connected from ('127.0.0.1', 52766)
+[LOGIN] AUTO-CLIENT
+[DATA #1] 4 sensors
+[DATA #2] 4 sensors
+[->] ANALYSIS pushed
+[DATA #3] 4 sensors
+[->] ALARM HIGH pushed
+[DATA #4] 4 sensors
+[->] ANALYSIS pushed
+[DATA #5] 4 sensors
+[DATA #6] 4 sensors
+[->] ANALYSIS pushed
+[->] ALARM WARN pushed
+[DATA #7] 4 sensors
+[DATA #8] 4 sensors
+[->] ANALYSIS pushed
+[DATA #9] 4 sensors
+[->] ALARM HIGH pushed
+[DATA #10] 4 sensors
+[->] ANALYSIS pushed
+[DATA #11] 4 sensors
+[DATA #12] 4 sensors
+[->] ANALYSIS pushed
+[->] ALARM WARN pushed
+[DATA #13] 4 sensors
+[DATA #14] 4 sensors
+[->] ANALYSIS pushed
+[DATA #15] 4 sensors
+[->] ALARM HIGH pushed
+[HEARTBEAT] -> ACK
+[DATA #16] 4 sensors
+[->] ANALYSIS pushed
+[DATA #17] 4 sensors
+[-] client disconnected, waiting for reconnect...

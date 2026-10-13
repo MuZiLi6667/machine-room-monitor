@@ -1,0 +1,5 @@
+AUTO_RESULT frames=20 dropped=0 points=80 uiTicks=80 bytes=360 last=26.7;60.5;369;228 run_seconds=40
+curve0 n=20 key=[1790090595..1790090633] val=[25.8..27] yaxis=[0..27.18]
+curve1 n=20 key=[1790090595..1790090633] val=[59.1..61] yaxis=[0..61.285]
+curve2 n=20 key=[1790090595..1790090633] val=[366..400] yaxis=[0..405.1]
+curve3 n=20 key=[1790090595..1790090633] val=[228..313] yaxis=[0..325.75]

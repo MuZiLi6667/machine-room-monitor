@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>机房环境监测系统 · 裸片 + 万能板焊接版 原理图参考</title>
+<style>
+  :root{
+    --ink:#1f2430; --sub:#5b6472; --line:#d6dbe3; --bg:#ffffff; --soft:#f6f8fb;
+    --red:#c0392b; --blue:#1f6feb; --green:#1a7f37; --amber:#9a6700;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#eef1f5;color:var(--ink);
+    font-family:"Microsoft YaHei","PingFang SC","Segoe UI",system-ui,sans-serif;
+    font-size:14px;line-height:1.7}
+  .page{max-width:1180px;margin:0 auto;background:var(--bg);padding:40px 48px 64px;
+    box-shadow:0 2px 24px rgba(20,30,50,.08)}
+  h1{font-size:24px;margin:0 0 6px;letter-spacing:.5px}
+  .lead{color:var(--sub);margin:0 0 26px}
+  h2{font-size:18px;margin:38px 0 12px;padding-left:11px;border-left:4px solid var(--blue)}
+  h3{font-size:15px;margin:22px 0 8px;color:#2b3444}
+  p{margin:8px 0}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;
+    padding:1px 5px;font-family:Consolas,Monaco,monospace;font-size:12.5px;color:#b3261e}
+  table{width:100%;border-collapse:collapse;margin:10px 0 4px;font-size:13px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  tbody tr:nth-child(even){background:#fbfcfe}
+  .tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:10px;
+    border:1px solid;margin-right:5px;white-space:nowrap}
+  .ok{color:var(--green);border-color:#b7e0c0;background:#eaf7ee}
+  .no{color:var(--red);border-color:#f0c8c2;background:#fdeeea}
+  .warn{color:var(--amber);border-color:#ecd9a8;background:#fdf6e3}
+  .box{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--amber);
+    border-radius:6px;padding:12px 16px;margin:14px 0}
+  .box.red{border-left-color:var(--red);background:#fdf1ef}
+  .box.blue{border-left-color:var(--blue);background:#eff5fe}
+  ul{margin:8px 0;padding-left:22px}
+  li{margin:4px 0}
+  .schwrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin:14px 0}
+  .cap{color:var(--sub);font-size:12.5px;margin:4px 0 0}
+  .small{font-size:12.5px;color:var(--sub)}
+  hr{border:none;border-top:1px solid var(--line);margin:34px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>机房环境监测系统 · 原理图参考（裸片 + 万能板焊接版）</h1>
+<p class="lead">主控：STM32F103C8T6（LQFP48 裸芯片） &nbsp;|&nbsp; 供电：USB 5V → AMS1117-3.3 &nbsp;|&nbsp; 装配：万能板手工焊接（取消面包板 / 杜邦线）</p>
+
+<div class="box blue">
+  <b>这一版和上一版的区别</b><br>
+  上一版假设主控用 Blue Pill 最小系统模块（模块自带晶振、复位、稳压、USB），因此原理图很干净。<br>
+  这一版按你的选择改用 <b>裸芯片 STM32F103C8T6</b>，所以原理图里 <b>新增了一整块「最小系统」</b>：8MHz 晶振电路、复位电路、BOOT 配置、VDDA 滤波、去耦电容组、USB→3.3V 稳压，以及 SWD 下载口。<br>
+  下面的接线表、元件清单、焊接步骤全部按「裸片 + 焊接」重做。
+</div>
+
+<h2>1. 系统连接原理图（拓扑示意）</h2>
+<p class="small">图保证「谁连谁」100% 正确；器件外形符号请在 Proteus 里按标准库选择（对照表见第 3 节）。电源网络 <b>3V3 / 5V / GND</b> 用母线表示，未逐根画线。</p>
+
+<div class="schwrap">
+<svg viewBox="0 0 1460 1120" width="100%" style="min-width:1080px" font-family="Consolas,monospace">
+  <defs>
+    <marker id="dot" markerWidth="8" markerHeight="8" refX="4" refY="4"><circle cx="4" cy="4" r="3.2" fill="#1f2430"/></marker>
+  </defs>
+
+  <!-- 电源母线 -->
+  <line x1="380" y1="100" x2="1200" y2="100" stroke="#c0392b" stroke-width="3"/>
+  <text x="1212" y="105" font-size="16" fill="#c0392b" font-weight="bold">3V3</text>
+  <line x1="380" y1="1045" x2="1200" y2="1045" stroke="#1f2430" stroke-width="3"/>
+  <text x="1212" y="1050" font-size="16" fill="#1f2430" font-weight="bold">GND</text>
+  <line x1="380" y1="100" x2="380" y2="255" stroke="#c0392b" stroke-width="2"/>
+  <text x="300" y="200" font-size="13" fill="#c0392b">+3V3</text>
+
+  <!-- ============ 电源块 ============ -->
+  <rect x="30" y="40" width="320" height="250" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="190" y="66" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2430">电源部分</text>
+  <text x="52" y="92" font-size="12.5" fill="#333">J1 Micro-USB（VBUS=5V）</text>
+  <text x="52" y="112" font-size="12.5" fill="#333">F1 自恢复保险 500mA（可选）</text>
+  <text x="52" y="132" font-size="12.5" fill="#333">C1 10µF / C2 100nF（5V 输入滤波）</text>
+  <text x="52" y="160" font-size="12.5" fill="#333" font-weight="bold">U2 AMS1117-3.3</text>
+  <text x="52" y="178" font-size="12.5" fill="#333">　3=IN(5V)　2=OUT　1=GND</text>
+  <text x="52" y="198" font-size="12.5" fill="#333">C3 10µF / C4 100nF（3V3 输出滤波）</text>
+  <text x="52" y="226" font-size="12.5" fill="#333">R1 1k + LED1（电源指示，3V3→GND）</text>
+  <text x="52" y="252" font-size="12.5" fill="#c0392b">5V 节点 → 供 MQ-2 加热丝</text>
+  <line x1="350" y1="100" x2="380" y2="100" stroke="#c0392b" stroke-width="2"/>
+  <line x1="190" y1="290" x2="190" y2="1045" stroke="#1f2430" stroke-width="1.6" stroke-dasharray="4 3"/>
+
+  <!-- ============ 晶振块 ============ -->
+  <rect x="150" y="255" width="350" height="130" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="325" y="279" font-size="14" font-weight="bold" text-anchor="middle">时钟（HSE）</text>
+  <text x="170" y="303" font-size="12.5">Y1 无源晶振 8MHz</text>
+  <text x="170" y="323" font-size="12.5">C9 22pF（OSC_IN→GND）</text>
+  <text x="170" y="343" font-size="12.5">C10 22pF（OSC_OUT→GND）</text>
+  <text x="170" y="368" font-size="12" fill="#5b6472">晶振尽量紧贴 MCU 的 5/6 脚</text>
+  <line x1="500" y1="300" x2="540" y2="300" stroke="#1f2430" stroke-width="1.6"/>
+  <line x1="500" y1="360" x2="540" y2="360" stroke="#1f2430" stroke-width="1.6"/>
+
+  <!-- ============ 复位块 ============ -->
+  <rect x="150" y="405" width="350" height="100" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="325" y="428" font-size="14" font-weight="bold" text-anchor="middle">复位</text>
+  <text x="170" y="451" font-size="12.5">R2 10k（3V3→NRST）　上拉</text>
+  <text x="170" y="471" font-size="12.5">C11 100nF（NRST→GND）</text>
+  <text x="170" y="491" font-size="12.5">SW1 轻触按键（NRST→GND）</text>
+  <line x1="500" y1="450" x2="540" y2="450" stroke="#1f2430" stroke-width="1.6"/>
+
+  <!-- ============ BOOT 块 ============ -->
+  <rect x="150" y="520" width="350" height="130" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="325" y="543" font-size="14" font-weight="bold" text-anchor="middle">BOOT 配置</text>
+  <text x="170" y="567" font-size="12.5">R3 10k（BOOT0→GND）　正常运行</text>
+  <text x="170" y="587" font-size="12.5">JP1 跳线（3V3→BOOT0）ISP 时短接</text>
+  <text x="170" y="607" font-size="12.5">R4 10k（PB2/BOOT1→GND）</text>
+  <text x="170" y="632" font-size="12" fill="#5b6472">烧完程序务必拆掉 JP1 跳线帽</text>
+  <line x1="500" y1="530" x2="540" y2="530" stroke="#1f2430" stroke-width="1.6"/>
+  <line x1="500" y1="600" x2="540" y2="600" stroke="#1f2430" stroke-width="1.6"/>
+
+  <!-- ============ MCU ============ -->
+  <rect x="610" y="220" width="280" height="620" rx="8" fill="#eaf1fd" stroke="#1f6feb" stroke-width="2"/>
+  <text x="750" y="252" font-size="16" font-weight="bold" text-anchor="middle" fill="#1f6feb">U1</text>
+  <text x="750" y="274" font-size="14" font-weight="bold" text-anchor="middle">STM32F103C8T6</text>
+  <text x="750" y="292" font-size="12" text-anchor="middle" fill="#5b6472">LQFP48 裸芯片</text>
+
+  <!-- 顶部电源脚 -->
+  <line x1="650" y1="220" x2="650" y2="170" stroke="#c0392b" stroke-width="1.6"/>
+  <rect x="634" y="150" width="32" height="20" rx="3" fill="#fff" stroke="#1f2430"/>
+  <text x="650" y="164" font-size="10" text-anchor="middle">L1</text>
+  <line x1="650" y1="150" x2="650" y2="100" stroke="#c0392b" stroke-width="1.6"/>
+  <text x="560" y="212" font-size="11.5">VDDA(9)</text>
+  <line x1="700" y1="220" x2="700" y2="100" stroke="#c0392b" stroke-width="1.6"/>
+  <text x="690" y="212" font-size="11.5">VDD1(24)</text>
+  <line x1="750" y1="220" x2="750" y2="100" stroke="#c0392b" stroke-width="1.6"/>
+  <text x="752" y="212" font-size="11.5">VDD2(36)</text>
+  <line x1="800" y1="220" x2="800" y2="100" stroke="#c0392b" stroke-width="1.6"/>
+  <text x="806" y="212" font-size="11.5">VDD3(48)</text>
+  <line x1="850" y1="220" x2="850" y2="100" stroke="#c0392b" stroke-width="1.6"/>
+  <text x="812" y="200" font-size="11.5">VBAT(1)</text>
+  <text x="600" y="140" font-size="12" fill="#5b6472">C5/C6/C7 100nF + C8 10µF 全部就近 3V3→GND</text>
+
+  <!-- 底部地脚 -->
+  <line x1="650" y1="840" x2="650" y2="1045" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="600" y="872" font-size="11.5">VSSA(8)</text>
+  <line x1="700" y1="840" x2="700" y2="1045" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="700" y="872" font-size="11.5">VSS1(23)</text>
+  <line x1="750" y1="840" x2="750" y2="1045" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="752" y="872" font-size="11.5">VSS2(35)</text>
+  <line x1="800" y1="840" x2="800" y2="1045" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="806" y="872" font-size="11.5">VSS3(47)</text>
+
+  <!-- 左侧信号脚 -->
+  <line x1="610" y1="300" x2="540" y2="300" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="556" y="294" font-size="11.5">PD0/OSC_IN(5)</text>
+  <line x1="610" y1="360" x2="540" y2="360" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="548" y="354" font-size="11.5">PD1/OSC_OUT(6)</text>
+  <line x1="610" y1="450" x2="540" y2="450" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="556" y="444" font-size="11.5">NRST(7)</text>
+  <line x1="610" y1="530" x2="540" y2="530" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="556" y="524" font-size="11.5">BOOT0(44)</text>
+  <line x1="610" y1="600" x2="540" y2="600" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="548" y="594" font-size="11.5">PB2/BOOT1(20)</text>
+
+  <!-- 右侧信号脚 -->
+  <line x1="890" y1="280" x2="1000" y2="280" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="274" font-size="11.5">PA0(10)</text>
+  <line x1="890" y1="360" x2="1000" y2="360" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="354" font-size="11.5">PB5(41)</text>
+  <line x1="890" y1="440" x2="1000" y2="440" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="434" font-size="11.5">PB6(42)</text>
+  <line x1="890" y1="505" x2="1000" y2="505" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="499" font-size="11.5">PB7(43)</text>
+  <line x1="890" y1="590" x2="1000" y2="590" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="584" font-size="11.5">PA9(30)</text>
+  <line x1="890" y1="650" x2="1000" y2="650" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="644" font-size="11.5">PA10(31)</text>
+  <line x1="890" y1="730" x2="1000" y2="730" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="724" font-size="11.5">PA13(34)</text>
+  <line x1="890" y1="790" x2="1000" y2="790" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="900" y="784" font-size="11.5">PA14(37)</text>
+
+  <!-- ============ MQ-2 块 ============ -->
+  <rect x="1010" y="225" width="420" height="115" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1220" y="248" font-size="13.5" font-weight="bold" text-anchor="middle">MQ-2 烟雾（VCC 必须 5V）</text>
+  <text x="1030" y="271" font-size="12">模块 VCC→5V　GND→GND</text>
+  <text x="1030" y="291" font-size="12" fill="#c0392b">AO → R6 10k → 节点A → R7 20k → GND</text>
+  <text x="1030" y="311" font-size="12" fill="#c0392b">节点A → PA0（ADC，禁超 3.3V）</text>
+  <text x="1030" y="331" font-size="11.5" fill="#5b6472">分压后满量程约 3.33V，保护 ADC</text>
+
+  <!-- ============ DHT11 块 ============ -->
+  <rect x="1010" y="345" width="420" height="95" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1220" y="368" font-size="13.5" font-weight="bold" text-anchor="middle">DHT11 温湿度</text>
+  <text x="1030" y="391" font-size="12">VDD→3V3　GND→GND</text>
+  <text x="1030" y="411" font-size="12">DATA → PB5　+ R5 4.7k 上拉到 3V3</text>
+  <text x="1030" y="430" font-size="11.5" fill="#5b6472">模块自带 4.7k 上拉时 R5 可省</text>
+
+  <!-- ============ BH1750 块 ============ -->
+  <rect x="1010" y="485" width="420" height="115" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1220" y="508" font-size="13.5" font-weight="bold" text-anchor="middle">BH1750 光照（GY-302）</text>
+  <text x="1030" y="531" font-size="12">VCC→3V3　GND→GND　ADDR→GND</text>
+  <text x="1030" y="551" font-size="12">SCL → PB6（软件 I²C）</text>
+  <text x="1030" y="571" font-size="12">SDA → PB7（软件 I²C）</text>
+  <text x="1030" y="591" font-size="11.5" fill="#5b6472">模块板载 I²C 上拉，无需外接</text>
+
+  <!-- ============ CH340 块 ============ -->
+  <rect x="1010" y="625" width="420" height="100" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1220" y="648" font-size="13.5" font-weight="bold" text-anchor="middle">CH340 USB-TTL（接 PC）</text>
+  <text x="1030" y="671" font-size="12">VCC→3V3　GND→GND（共地！）</text>
+  <text x="1030" y="691" font-size="12">TXD → PA10(USART1_RX)</text>
+  <text x="1030" y="711" font-size="12">RXD → PA9(USART1_TX)　115200-8-N-1</text>
+
+  <!-- ============ SWD 块 ============ -->
+  <rect x="1010" y="745" width="420" height="100" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1220" y="768" font-size="13.5" font-weight="bold" text-anchor="middle">J2 SWD 下载口（ST-Link V2）</text>
+  <text x="1030" y="791" font-size="12">1-3V3　2-PA13(SWDIO)　3-PA14(SWCLK)</text>
+  <text x="1030" y="811" font-size="12">4-NRST　5-GND</text>
+
+  <text x="30" y="1090" font-size="12" fill="#5b6472">红=3V3 网络　黑=GND 网络　信号线以文字标注网络名（Proteus 里可用网络标签同名互联）</text>
+</svg>
+</div>
+<p class="cap">图 1　系统连接拓扑（裸片版）。MCU 只画了用到的引脚，未用引脚悬空即可。</p>
+
+<h2>2. MCU 引脚连接总表（照此连线，A→B 即两端相连）</h2>
+
+<h3>2.1 电源与地</h3>
+<table>
+<thead><tr><th>从</th><th>到</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>U1.24 VDD_1</td><td>3V3</td><td>并 C5 100nF→GND</td></tr>
+<tr><td>U1.36 VDD_2</td><td>3V3</td><td>并 C6 100nF→GND</td></tr>
+<tr><td>U1.48 VDD_3</td><td>3V3</td><td>并 C7 100nF→GND</td></tr>
+<tr><td>—</td><td>—</td><td>C8 10µF 3V3→GND（整板储能，靠近 MCU）</td></tr>
+<tr><td>U1.1 VBAT</td><td>3V3</td><td>不用纽扣电池时直接接 3V3</td></tr>
+<tr><td>U1.9 VDDA</td><td>L1 → 3V3</td><td>经铁氧体磁珠/10µH，并 C12 100nF + C13 1µF→GND</td></tr>
+<tr><td>U1.8 VSSA</td><td>GND</td><td>模拟地，就近接地</td></tr>
+<tr><td>U1.23 VSS_1</td><td>GND</td><td></td></tr>
+<tr><td>U1.35 VSS_2</td><td>GND</td><td></td></tr>
+<tr><td>U1.47 VSS_3</td><td>GND</td><td></td></tr>
+</tbody>
+</table>
+
+<h3>2.2 时钟 / 复位 / BOOT / 下载</h3>
+<table>
+<thead><tr><th>从</th><th>到</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>U1.5 PD0/OSC_IN</td><td>Y1.1</td><td>Y1 另一端接 U1.6；C9 22pF 在 U1.5→GND</td></tr>
+<tr><td>U1.6 PD1/OSC_OUT</td><td>Y1.2</td><td>C10 22pF 在 U1.6→GND</td></tr>
+<tr><td>U1.7 NRST</td><td>R2 10k→3V3</td><td>上拉</td></tr>
+<tr><td>U1.7 NRST</td><td>C11 100nF→GND</td><td>去抖/复位延时</td></tr>
+<tr><td>U1.7 NRST</td><td>SW1→GND</td><td>按键复位</td></tr>
+<tr><td>U1.44 BOOT0</td><td>R3 10k→GND</td><td>默认从 Flash 启动</td></tr>
+<tr><td>U1.44 BOOT0</td><td>JP1 → 3V3</td><td>串口 ISP 烧录时短接，平时断开</td></tr>
+<tr><td>U1.20 PB2/BOOT1</td><td>R4 10k→GND</td><td>必须为低</td></tr>
+<tr><td>U1.34 PA13</td><td>J2.2 SWDIO</td><td>ST-Link V2</td></tr>
+<tr><td>U1.37 PA14</td><td>J2.3 SWCLK</td><td>ST-Link V2</td></tr>
+<tr><td>U1.7 NRST</td><td>J2.4</td><td>SWD 复位（可选）</td></tr>
+</tbody>
+</table>
+
+<h3>2.3 外设</h3>
+<table>
+<thead><tr><th>从</th><th>到</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>MQ-2.AO</td><td>R6 10k → 节点A</td><td>节点A = R6.2 与 R7.1 交点</td></tr>
+<tr><td>节点A</td><td>U1.10 PA0</td><td>ADC 采样，<b>必须经分压</b></td></tr>
+<tr><td>节点A</td><td>R7 20k → GND</td><td>下臂</td></tr>
+<tr><td>MQ-2.VCC</td><td>5V</td><td>加热丝需 5V</td></tr>
+<tr><td>DHT11.DATA</td><td>U1.41 PB5</td><td>并 R5 4.7k→3V3（裸元件时）</td></tr>
+<tr><td>DHT11.VDD</td><td>3V3</td><td></td></tr>
+<tr><td>BH1750.SCL</td><td>U1.42 PB6</td><td>软件 I²C</td></tr>
+<tr><td>BH1750.SDA</td><td>U1.43 PB7</td><td>软件 I²C</td></tr>
+<tr><td>BH1750.ADDR</td><td>GND</td><td>器件地址 0x23</td></tr>
+<tr><td>BH1750.VCC</td><td>3V3</td><td></td></tr>
+<tr><td>CH340.TXD</td><td>U1.31 PA10</td><td>RX 端，交叉连接</td></tr>
+<tr><td>CH340.RXD</td><td>U1.30 PA9</td><td>TX 端，交叉连接</td></tr>
+<tr><td>CH340.GND</td><td>GND</td><td><b>必须共地</b>，否则通信乱码</td></tr>
+</tbody>
+</table>
+
+<div class="box red">
+  <b>全图唯一会烧芯片的地方：MQ-2 分压。</b> MQ-2 用 5V 供电时 AO 可达 5V，STM32 的 ADC 引脚上限 3.3V。
+  必须 R6=10k（上臂）、R7=20k（下臂），分压比 20/(10+20)=0.667，5V→3.33V。分压中点接 PA0。<b>漏掉这一步会直接打坏 PA0。</b>
+</div>
+
+<h2>3. Proteus 器件库对照表（照着搜，避免搜不到）</h2>
+<table>
+<thead><tr><th>原理图器件</th><th>Proteus 里搜什么</th><th>库 / 状态</th></tr></thead>
+<tbody>
+<tr><td>STM32F103C8T6</td><td><code>STM32F103C8</code></td><td><span class="tag ok">CM3_STM32.LIB</span> 已验证</td></tr>
+<tr><td>8MHz 晶振</td><td><code>CRYSTAL</code>，值填 8MHz</td><td><span class="tag ok">已验证</span></td></tr>
+<tr><td>电阻</td><td><code>RES</code></td><td><span class="tag ok">DEVICE.LIB</span></td></tr>
+<tr><td>普通电容（100nF/22pF）</td><td><code>CAP</code></td><td><span class="tag ok">DEVICE.LIB</span></td></tr>
+<tr><td>电解/大电容（10µF）</td><td><code>CAP-ELEC</code></td><td><span class="tag ok">DEVICE.LIB</span> 已验证</td></tr>
+<tr><td>轻触按键</td><td><code>BUTTON</code></td><td><span class="tag ok">ACTIVE.LIB</span> 已验证</td></tr>
+<tr><td>发光二极管</td><td><code>LED-RED</code> / <code>LED-GREEN</code></td><td><span class="tag ok">ACTIVE.LIB</span> 已验证</td></tr>
+<tr><td>排针 / 接插件</td><td><code>CONN-SIL4</code>（2/3/5 脚类推）</td><td><span class="tag ok">ACTIVE.LIB</span> 已验证</td></tr>
+<tr><td>电感 / 磁珠 L1</td><td><code>INDUCTOR</code>，或直接用 0Ω 电阻</td><td><span class="tag ok">DEVICE.LIB</span></td></tr>
+<tr><td>3.3V 稳压 AMS1117</td><td>搜不到专用型号 → 用通用三端稳压符号（如 <code>REGULATOR</code>/<code>7805</code> 类），标注 AMS1117-3.3</td><td><span class="tag warn">无专用模型</span></td></tr>
+<tr><td>Micro-USB 座 J1</td><td>搜 <code>USB</code> 选 USB 连接器符号；或用 <code>CONN-SIL4</code> 画 4 脚代表 VBUS/GND/D-/D+</td><td><span class="tag warn">符号名因版本而异</span></td></tr>
+<tr><td>DHT11</td><td><code>DHT11</code></td><td><span class="tag ok">TRXD.LIB</span> 已验证，8.6+ 带仿真模型</td></tr>
+<tr><td>MQ-2</td><td>无模型 → 用 <code>POT-HG</code>（可调电阻）模拟 AO 电压</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+<tr><td>BH1750</td><td>无模型 → 用 <code>POT-HG</code> 或 <code>I2C</code> 从机模拟</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+<tr><td>CH340</td><td>无模型 → 用 <code>COMPIM</code> 或 <code>VIRTUAL TERMINAL</code> 代表串口</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+</tbody>
+</table>
+<p class="small">库名已在你的 Proteus 8.17 安装目录 <code>DATA\LIBRARY</code> 中逐项核对过。标「无」的器件，仿真时按替代件处理；只画原理图则用任意符号 + 网络标签即可。</p>
+
+<h2>4. 元件清单（万能板焊接版 BOM）</h2>
+<table>
+<thead><tr><th>位号</th><th>器件</th><th>规格</th><th>数量</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>U1</td><td>STM32F103C8T6</td><td>LQFP48</td><td>1</td><td>建议用 LQFP48 转 DIP 转接板，方便焊与换</td></tr>
+<tr><td>U2</td><td>AMS1117-3.3</td><td>SOT-223</td><td>1</td><td>USB 5V→3.3V，<b>裸片必需</b></td></tr>
+<tr><td>J1</td><td>Micro-USB 母座</td><td>5P</td><td>1</td><td>取电用</td></tr>
+<tr><td>J2</td><td>排针 5P + 排母</td><td>2.54mm</td><td>1</td><td>SWD 下载口</td></tr>
+<tr><td>JP1</td><td>排针 2P + 跳线帽</td><td>2.54mm</td><td>1</td><td>BOOT0 选择</td></tr>
+<tr><td>Y1</td><td>无源晶振</td><td>8MHz（HC-49S）</td><td>1</td><td></td></tr>
+<tr><td>SW1</td><td>轻触按键</td><td>6×6mm</td><td>1</td><td>复位</td></tr>
+<tr><td>L1</td><td>铁氧体磁珠 / 电感</td><td>600Ω@100MHz 或 10µH</td><td>1</td><td>VDDA 滤波；也可 0Ω 直连</td></tr>
+<tr><td>F1</td><td>自恢复保险丝</td><td>500mA（可选）</td><td>1</td><td>USB 进线保护</td></tr>
+<tr><td>R1</td><td>电阻</td><td>1kΩ</td><td>1</td><td>电源指示灯限流</td></tr>
+<tr><td>R2 / R3 / R4</td><td>电阻</td><td>10kΩ</td><td>3</td><td>复位上拉 / BOOT0 / BOOT1</td></tr>
+<tr><td>R5</td><td>电阻</td><td>4.7kΩ</td><td>1</td><td>DHT11 上拉（模块自带则省）</td></tr>
+<tr><td>R6</td><td>电阻</td><td>10kΩ</td><td>1</td><td>MQ-2 分压上臂</td></tr>
+<tr><td>R7</td><td>电阻</td><td>20kΩ</td><td>1</td><td>MQ-2 分压下臂</td></tr>
+<tr><td>C1 / C3 / C8</td><td>电容</td><td>10µF</td><td>3</td><td>电源储能</td></tr>
+<tr><td>C2 / C4 / C5 / C6 / C7 / C11 / C12</td><td>电容</td><td>100nF</td><td>7</td><td>去耦</td></tr>
+<tr><td>C9 / C10</td><td>电容</td><td>22pF</td><td>2</td><td>晶振负载</td></tr>
+<tr><td>C13</td><td>电容</td><td>1µF</td><td>1</td><td>VDDA</td></tr>
+<tr><td>DHT11</td><td>温湿度模块</td><td>3P</td><td>1</td><td></td></tr>
+<tr><td>MQ-2</td><td>烟雾模块</td><td>4P</td><td>1</td><td>5V 供电</td></tr>
+<tr><td>BH1750</td><td>GY-302 光照模块</td><td>5P</td><td>1</td><td>3.3V</td></tr>
+<tr><td>CH340</td><td>USB-TTL 模块</td><td>—</td><td>1</td><td>接 PC</td></tr>
+<tr><td>ST-Link V2</td><td>下载器</td><td>—</td><td>1</td><td>烧录/调试</td></tr>
+<tr><td>—</td><td>万能板（洞洞板）</td><td>双面镀锡 5×7cm 或 7×9cm</td><td>1</td><td>建议 7×9cm 留余量</td></tr>
+<tr><td>—</td><td>排母 / 单排针</td><td>2.54mm</td><td>若干</td><td>模块做插座，便于更换</td></tr>
+<tr><td>—</td><td>焊锡丝 / 助焊剂 / 细漆包线</td><td>0.6mm 焊锡、0.3~0.5mm 飞线</td><td>若干</td><td>走线用</td></tr>
+</tbody>
+</table>
+
+<h2>5. 万能板焊接装配指南</h2>
+
+<h3>5.1 布局规划（先在纸上排一遍）</h3>
+<ul>
+<li><b>中央</b>：U1（转接板）+ 晶振 Y1 + 去耦电容 C5~C8 —— 晶振紧贴 MCU 的 5/6 脚，去耦电容紧贴电源脚。</li>
+<li><b>左上</b>：电源区 J1 → F1 → U2 → C1/C2/C3/C4，输出 3V3 到板中央的电源母线。</li>
+<li><b>左侧/下方</b>：SW1 复位键、JP1 BOOT 跳线、J2 SWD 口，放在板边方便插拔。</li>
+<li><b>右侧</b>：四个模块（DHT11 / MQ-2 / BH1750 / CH340）用排母做成"插座"，天线的传感器模块悬空或用短线引出，避免发热影响温湿度读数。</li>
+<li><b>电源母线</b>：在万能板上用两根粗铜线（或加锡走粗）分别做 3V3 与 GND 干线，所有器件就近搭接，形成星形地。</li>
+</ul>
+
+<h3>5.2 焊接顺序（由矮到高、由小到大）</h3>
+<ol>
+<li>先焊 <b>电阻、IC 座/转接板、晶振、小电容（100nF/22pF）</b>——矮、耐热、数量多。</li>
+<li>再焊 <b>AMS1117、电解电容 C1/C3/C8、按键、USB 座、排针排母</b>——较高、怕热。</li>
+<li>LQFP48：<b>先对角固定两个脚</b>，再逐边拖焊；或直接买 LQFP48→DIP 转接板，风险最低。</li>
+<li>每焊完一个区域，用万用表<b>测相邻脚是否短路</b>，尤其是 MCU 电源脚与地。</li>
+</ol>
+
+<div class="box">
+  <b>先焊电源、先测电源、再装 MCU。</b> 焊好电源部分后，先只焊 U2 和滤波电容，插上 USB 测 3V3 是否在 3.3±0.1V；确认无误再装 MCU 和其余部分。这一步能避免"一上电就把 MCU 烧了"。
+</div>
+
+<h3>5.3 走线建议</h3>
+<ul>
+<li>电源线与地线走粗（多用几个焊盘串联，或加锡堆厚）；信号线用 0.3~0.5mm 漆包线飞线，走最短路径。</li>
+<li>晶振两根线尽量短且等长，晶振外壳/负载电容就近接地。</li>
+<li>MQ-2 的分压节点 A 到 PA0 的线尽量短，远离 5V 和 MQ-2 加热丝的走线。</li>
+<li>I²C（PB6/PB7）与串口（PA9/PA10）分开走，避免平行过长。</li>
+<li>所有模块的 GND 都汇到同一根地干线，<b>不要形成地环路</b>。</li>
+</ul>
+
+<h2>6. 仿真设置与避坑清单（与你的代码直接相关）</h2>
+<div class="box blue">
+  <b>Proteus 里必做：</b>
+  <ol style="margin:6px 0">
+    <li>双击 U1，<code>Program File</code> 指向 Keil 编出的 <code>.hex</code>。</li>
+    <li><code>Crystal Frequency</code> 设为 <b>8MHz</b>（与 Y1 一致）。上一版用模块时写的是 8MHz，裸片版同理，必须和代码里的 <code>SystemInit</code> 一致，否则串口波特率和延时全错。</li>
+    <li>Proteus 的 STM32 模型运行时用的是模型内部时钟，若代码切了外部晶振，先确认模型属性里的频率与之一致；不一致会直接跑飞。</li>
+  </ol>
+</div>
+<ul>
+<li><b>MQ-2 / BH1750 / CH340 在 Proteus 里没有模型</b>，仿真时分别用 POT-HG / I2C 从机 / COMPIM 替代，只验证 ADC 读值与 I²C、串口时序即可。</li>
+<li><b>DHT11 仿真模型时序容差比实物宽</b>，仿真能通不代表实物能通，实物上要单独用示波器/逻辑分析仪看 DATA 时序。</li>
+<li>数值缩放：温度/湿度 ×10（25.6℃ → 0x0100），烟雾/光照<b>不缩放</b>（312 → 0x0138）——这条和上一版一致，别统一乘 10。</li>
+<li>万能板实物上，<b>CH340 必须与板子共地</b>，只接 TX/RX 不接地是最常见的"能通电但不通信"原因。</li>
+<li>BOOT0 跳线：正常运行时 JP1 必须断开；下载完忘记拔掉跳线帽，会导致下次上电进不了用户程序。</li>
+</ul>
+
+<hr>
+<p class="small">配套文件：<code>接线表.md</code>（原版接线表）、<code>原理图参考.html</code>（模块版）、本文件（裸片焊接版）。<br>
+本文件是「连接拓扑 + 接线表 + BOM + 焊接工艺」，保证连接正确；Proteus 里的器件外形符号按第 3 节对照表选择。</p>
+
+</div>
+</body>
+</html>

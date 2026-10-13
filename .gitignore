@@ -16,6 +16,27 @@ client-qt/**/build-*/
 client-qt/**/*.pro.user
 client-qt/release/
 client-qt/debug/
+client-qt/Makefile
+client-qt/Makefile.*
+client-qt/.qmake.stash
+client-qt/*.exe
+client-qt/moc_*
+client-qt/ui_*
+
+# 任务B（Qt）发布包：windeployqt 部署的运行库与打包目录。
+# 交付给用户的 exe/zip 体积大且可由源码重新生成，不入库；
+# 重新打包方法见 client-qt/使用说明.txt 与 README「自己编译」一节。
+client-qt/*.dll
+client-qt/generic/
+client-qt/iconengines/
+client-qt/imageformats/
+client-qt/networkinformation/
+client-qt/platforms/
+client-qt/styles/
+client-qt/tls/
+client-qt/translations/
+client-qt/机房环境监测客户端/
+client-qt/*.zip
 
 # Python 缓存
 __pycache__/
@@ -26,3 +47,5 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+*.bak
+*.pdsprj.*.workspace

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>机房环境监测系统 · Blue Pill 模块 + 万能板焊接版 原理图参考</title>
+<style>
+  :root{
+    --ink:#1f2430; --sub:#5b6472; --line:#d6dbe3; --bg:#ffffff; --soft:#f6f8fb;
+    --red:#c0392b; --blue:#1f6feb; --green:#1a7f37; --amber:#9a6700;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#eef1f5;color:var(--ink);
+    font-family:"Microsoft YaHei","PingFang SC","Segoe UI",system-ui,sans-serif;
+    font-size:14px;line-height:1.7}
+  .page{max-width:1180px;margin:0 auto;background:var(--bg);padding:40px 48px 64px;
+    box-shadow:0 2px 24px rgba(20,30,50,.08)}
+  h1{font-size:24px;margin:0 0 6px;letter-spacing:.5px}
+  .lead{color:var(--sub);margin:0 0 26px}
+  h2{font-size:18px;margin:38px 0 12px;padding-left:11px;border-left:4px solid var(--blue)}
+  h3{font-size:15px;margin:22px 0 8px;color:#2b3444}
+  p{margin:8px 0}
+  code{background:var(--soft);border:1px solid var(--line);border-radius:4px;
+    padding:1px 5px;font-family:Consolas,Monaco,monospace;font-size:12.5px;color:#b3261e}
+  table{width:100%;border-collapse:collapse;margin:10px 0 4px;font-size:13px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:600}
+  tbody tr:nth-child(even){background:#fbfcfe}
+  .tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:10px;
+    border:1px solid;margin-right:5px;white-space:nowrap}
+  .ok{color:var(--green);border-color:#b7e0c0;background:#eaf7ee}
+  .no{color:var(--red);border-color:#f0c8c2;background:#fdeeea}
+  .warn{color:var(--amber);border-color:#ecd9a8;background:#fdf6e3}
+  .box{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--amber);
+    border-radius:6px;padding:12px 16px;margin:14px 0}
+  .box.red{border-left-color:var(--red);background:#fdf1ef}
+  .box.blue{border-left-color:var(--blue);background:#eff5fe}
+  .box.green{border-left-color:var(--green);background:#eef8f1}
+  ul{margin:8px 0;padding-left:22px}
+  li{margin:4px 0}
+  .schwrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin:14px 0}
+  .cap{color:var(--sub);font-size:12.5px;margin:4px 0 0}
+  .small{font-size:12.5px;color:var(--sub)}
+  hr{border:none;border-top:1px solid var(--line);margin:34px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>机房环境监测系统 · 原理图参考（Blue Pill + 万能板焊接版）</h1>
+<p class="lead">主控：STM32F103C8T6 最小系统板（Blue Pill） &nbsp;|&nbsp; 供电：模块自带 Micro-USB 口取 5V &nbsp;|&nbsp; 装配：万能板手工焊接（取消面包板 / 杜邦线）</p>
+
+<div class="box blue">
+  <b>这一版和上一版（裸片焊接版）的区别</b><br>
+  上一版用裸芯片 STM32F103C8T6，原理图里必须自建一整块最小系统。<br>
+  这一版改回 <b>Blue Pill 最小系统模块</b>，下面这些<b>全部由模块板自带，原理图里不需要画了</b>：
+  <ul style="margin:6px 0">
+    <li>8MHz 晶振 Y1 + 22pF 负载电容</li>
+    <li>复位电路（10k 上拉 + 100nF + 轻触按键 SW1）</li>
+    <li>BOOT0 / BOOT1 跳线（板上两个跳线帽）</li>
+    <li>3.3V 稳压器（AMS1117 / RT9193）+ 输入输出滤波电容</li>
+    <li>Micro-USB 座 J1 + 电源指示灯（PWR LED）</li>
+    <li>MCU 去耦电容组 C5~C8、VDDA 滤波</li>
+  </ul>
+  所以本图 = <b>模块 + 4 个外设 + 1 处分压 + 3 根电源干线</b>，焊接点比裸片版少一大半，成功率也高得多。<br>
+  <b>但有一件事完全没变：MQ-2 的 10k/20k 分压必须保留。</b> 换主控不改变 STM32 的 ADC 上限（3.3V）。
+</div>
+
+<h2>1. 系统连接原理图（拓扑示意）</h2>
+<p class="small">图保证「谁连谁」100% 正确；器件外形符号请在 Proteus 里按标准库选择（对照表见第 3 节）。电源网络 <b>3V3 / 5V / GND</b> 用母线表示，未逐根画线。</p>
+
+<div class="schwrap">
+<svg viewBox="0 0 1420 1060" width="100%" style="min-width:1080px" font-family="Consolas,monospace">
+  <defs>
+    <marker id="dot" markerWidth="8" markerHeight="8" refX="4" refY="4"><circle cx="4" cy="4" r="3.2" fill="#1f2430"/></marker>
+  </defs>
+
+  <!-- ============ 电源母线 ============ -->
+  <line x1="360" y1="90" x2="1240" y2="90" stroke="#c0392b" stroke-width="3"/>
+  <text x="1252" y="95" font-size="16" fill="#c0392b" font-weight="bold">3V3</text>
+  <line x1="360" y1="130" x2="1240" y2="130" stroke="#d97706" stroke-width="3"/>
+  <text x="1252" y="135" font-size="16" fill="#d97706" font-weight="bold">5V</text>
+  <line x1="360" y1="1000" x2="1240" y2="1000" stroke="#1f2430" stroke-width="3"/>
+  <text x="1252" y="1005" font-size="16" fill="#1f2430" font-weight="bold">GND</text>
+
+  <!-- ============ 电源来源块 ============ -->
+  <rect x="30" y="190" width="310" height="215" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="185" y="216" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2430">电源来源（模块自带）</text>
+  <text x="52" y="244" font-size="12.5" fill="#333">J1 Micro-USB（在 Blue Pill 板上）</text>
+  <text x="52" y="264" font-size="12.5" fill="#333">VBUS = 5V → 直接引到「5V」排针</text>
+  <text x="52" y="284" font-size="12.5" fill="#c0392b">板载稳压 → 3.3V → 引到「3V3」排针</text>
+  <text x="52" y="306" font-size="12.5" fill="#333">板载 PWR LED：上电即亮</text>
+  <text x="52" y="336" font-size="12.5" fill="#d97706">5V 排针 → 专供 MQ-2 加热丝（≈150mA）</text>
+  <text x="52" y="356" font-size="12.5" fill="#c0392b">3V3 排针 → 供 DHT11 / BH1750（≈45mA）</text>
+  <text x="52" y="382" font-size="11.5" fill="#5b6472">MQ-2 加热丝禁止接 3.3V，会拉垮稳压器</text>
+  <line x1="340" y1="90" x2="360" y2="90" stroke="#c0392b" stroke-width="2"/>
+  <line x1="340" y1="130" x2="360" y2="130" stroke="#d97706" stroke-width="2"/>
+  <line x1="185" y1="405" x2="185" y2="1000" stroke="#1f2430" stroke-width="1.6" stroke-dasharray="4 3"/>
+
+  <!-- ============ MCU（Blue Pill 模块） ============ -->
+  <rect x="560" y="200" width="300" height="700" rx="8" fill="#eaf1fd" stroke="#1f6feb" stroke-width="2"/>
+  <text x="710" y="234" font-size="16" font-weight="bold" text-anchor="middle" fill="#1f6feb">U1</text>
+  <text x="710" y="258" font-size="14" font-weight="bold" text-anchor="middle">STM32F103C8T6</text>
+  <text x="710" y="278" font-size="12.5" font-weight="bold" text-anchor="middle">Blue Pill 最小系统模块</text>
+  <text x="710" y="298" font-size="11.5" text-anchor="middle" fill="#5b6472">板载：8M 晶振 / 复位键 / BOOT 跳线 / 稳压</text>
+  <text x="710" y="316" font-size="11.5" text-anchor="middle" fill="#5b6472">/ Micro-USB / PWR LED</text>
+
+  <!-- 顶部电源脚 -->
+  <line x1="620" y1="200" x2="620" y2="90" stroke="#c0392b" stroke-width="2"/>
+  <text x="628" y="196" font-size="11.5" fill="#c0392b">3V3 排针</text>
+  <line x1="700" y1="200" x2="700" y2="130" stroke="#d97706" stroke-width="2"/>
+  <text x="708" y="196" font-size="11.5" fill="#d97706">5V 排针</text>
+
+  <!-- 底部地脚 -->
+  <line x1="620" y1="900" x2="620" y2="1000" stroke="#1f2430" stroke-width="2"/>
+  <text x="556" y="928" font-size="11.5">GND</text>
+  <line x1="700" y1="900" x2="700" y2="1000" stroke="#1f2430" stroke-width="2"/>
+  <text x="708" y="928" font-size="11.5">GND</text>
+
+  <!-- 右侧信号脚 -->
+  <line x1="860" y1="280" x2="980" y2="280" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="274" font-size="11.5">PA0 (ADC1_IN0)</text>
+  <line x1="860" y1="420" x2="980" y2="420" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="414" font-size="11.5">PB5</text>
+  <line x1="860" y1="540" x2="980" y2="540" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="534" font-size="11.5">PB6</text>
+  <line x1="860" y1="585" x2="980" y2="585" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="579" font-size="11.5">PB7</text>
+  <line x1="860" y1="685" x2="980" y2="685" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="679" font-size="11.5">PA9 (USART1_TX)</text>
+  <line x1="860" y1="725" x2="980" y2="725" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="719" font-size="11.5">PA10 (USART1_RX)</text>
+  <line x1="860" y1="820" x2="980" y2="820" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="814" font-size="11.5">PA13 (SWDIO)</text>
+  <line x1="860" y1="860" x2="980" y2="860" stroke="#1f2430" stroke-width="1.6"/>
+  <text x="868" y="854" font-size="11.5">PA14 (SWCLK)</text>
+
+  <!-- ============ MQ-2 块 ============ -->
+  <rect x="980" y="215" width="420" height="130" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1190" y="240" font-size="13.5" font-weight="bold" text-anchor="middle">MQ-2 烟雾（VCC 必须接 5V 排针）</text>
+  <text x="1000" y="264" font-size="12">模块 VCC→5V　GND→GND</text>
+  <text x="1000" y="286" font-size="12" fill="#c0392b">AO → R1 10k → 节点A → R2 20k → GND</text>
+  <text x="1000" y="308" font-size="12" fill="#c0392b">节点A → PA0（ADC，禁超 3.3V）</text>
+  <text x="1000" y="330" font-size="11.5" fill="#5b6472">分压后满量程约 3.33V，保护 ADC</text>
+
+  <!-- ============ DHT11 块 ============ -->
+  <rect x="980" y="365" width="420" height="110" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1190" y="390" font-size="13.5" font-weight="bold" text-anchor="middle">DHT11 温湿度</text>
+  <text x="1000" y="414" font-size="12">VDD→3V3　GND→GND</text>
+  <text x="1000" y="436" font-size="12">DATA → PB5　+ R3 4.7k 上拉到 3V3</text>
+  <text x="1000" y="458" font-size="11.5" fill="#5b6472">3 针模块自带 4.7k 上拉，R3 可省</text>
+
+  <!-- ============ BH1750 块 ============ -->
+  <rect x="980" y="495" width="420" height="130" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1190" y="520" font-size="13.5" font-weight="bold" text-anchor="middle">BH1750 光照（GY-302）</text>
+  <text x="1000" y="544" font-size="12">VCC→3V3　GND→GND　ADDR→GND</text>
+  <text x="1000" y="566" font-size="12">SCL → PB6（软件 I²C）</text>
+  <text x="1000" y="588" font-size="12">SDA → PB7（软件 I²C）</text>
+  <text x="1000" y="610" font-size="11.5" fill="#5b6472">模块板载 I²C 上拉，无需外接</text>
+
+  <!-- ============ CH340 块 ============ -->
+  <rect x="980" y="645" width="420" height="120" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1190" y="670" font-size="13.5" font-weight="bold" text-anchor="middle">CH340 USB-TTL（接 PC）</text>
+  <text x="1000" y="694" font-size="12">TXD → PA10(USART1_RX)</text>
+  <text x="1000" y="716" font-size="12">RXD → PA9(USART1_TX)　115200-8-N-1</text>
+  <text x="1000" y="738" font-size="12" fill="#c0392b">GND → GND（必须共地）</text>
+  <text x="1000" y="757" font-size="11.5" fill="#5b6472">VCC 不接：模块由自身 USB 口供电，电平跳线设 3.3V</text>
+
+  <!-- ============ SWD 块 ============ -->
+  <rect x="980" y="785" width="420" height="110" rx="8" fill="#f2f5fa" stroke="#8fa0b6"/>
+  <text x="1190" y="810" font-size="13.5" font-weight="bold" text-anchor="middle">SWD 下载调试（ST-Link V2）</text>
+  <text x="1000" y="834" font-size="12">PA13→SWDIO　PA14→SWCLK　GND→GND</text>
+  <text x="1000" y="856" font-size="12" fill="#c0392b">只接 3 根，不要再接 ST-Link 的 3.3V</text>
+  <text x="1000" y="878" font-size="11.5" fill="#5b6472">Blue Pill 板载已有 4 针调试排针，可直接插</text>
+
+  <text x="30" y="1040" font-size="12" fill="#5b6472">红=3V3 网络　橙=5V 网络　黑=GND 网络　信号线以文字标注网络名（Proteus 里可用网络标签同名互联）</text>
+</svg>
+</div>
+<p class="cap">图 1　系统连接拓扑（Blue Pill 版）。模块只画了用到的引脚，未用引脚悬空即可。</p>
+
+<h2>2. 引脚连接总表（照此连线，A→B 即两端相连）</h2>
+<p class="small">Blue Pill 的排针按 <b>板上丝印</b> 找对应标号即可（模块排针顺序各批次略有差异，一律以丝印为准，不要按位置硬记）。</p>
+
+<h3>2.1 电源与地</h3>
+<table>
+<thead><tr><th>从（模块丝印）</th><th>到</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>U1 <code>5V</code></td><td>MQ-2.VCC</td><td><b>必须 5V</b>，加热丝约 150mA；由 USB VBUS 提供</td></tr>
+<tr><td>U1 <code>3V3</code></td><td>DHT11.VDD</td><td>板载稳压输出</td></tr>
+<tr><td>U1 <code>3V3</code></td><td>BH1750.VCC</td><td></td></tr>
+<tr><td>U1 <code>3V3</code></td><td>R3（DHT11 上拉上端）</td><td>模块自带 4.7k 时可省</td></tr>
+<tr><td>U1 <code>GND</code></td><td>全部模块 GND</td><td>单点汇流，<b>CH340 必须共地</b></td></tr>
+<tr><td>—</td><td>—</td><td>板载 PWR LED 上电即亮，无需外接指示灯</td></tr>
+</tbody>
+</table>
+
+<h3>2.2 信号与外设</h3>
+<table>
+<thead><tr><th>从</th><th>到</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>MQ-2.AO</td><td>R1 10k → 节点A</td><td>节点A = R1 下端与 R2 上端交点</td></tr>
+<tr><td>节点A</td><td>U1 <code>PA0</code></td><td>ADC1_IN0，<b>必须经分压</b></td></tr>
+<tr><td>节点A</td><td>R2 20k → GND</td><td>分压下臂</td></tr>
+<tr><td>DHT11.DATA</td><td>U1 <code>PB5</code></td><td>单总线，开漏；并 R3 4.7k→3V3</td></tr>
+<tr><td>BH1750.SCL</td><td>U1 <code>PB6</code></td><td>软件 I²C</td></tr>
+<tr><td>BH1750.SDA</td><td>U1 <code>PB7</code></td><td>软件 I²C</td></tr>
+<tr><td>BH1750.ADDR</td><td>GND</td><td>器件地址 0x23</td></tr>
+<tr><td>CH340.TXD</td><td>U1 <code>PA10</code></td><td>USART1_RX，<b>交叉连接</b></td></tr>
+<tr><td>CH340.RXD</td><td>U1 <code>PA9</code></td><td>USART1_TX，<b>交叉连接</b></td></tr>
+<tr><td>ST-Link SWDIO</td><td>U1 <code>PA13</code></td><td>SWD 下载调试</td></tr>
+<tr><td>ST-Link SWCLK</td><td>U1 <code>PA14</code></td><td>SWD 下载调试</td></tr>
+<tr><td>ST-Link GND</td><td>U1 <code>GND</code></td><td>共地</td></tr>
+</tbody>
+</table>
+
+<div class="box red">
+  <b>全图唯一会烧芯片的地方：MQ-2 分压。</b> MQ-2 用 5V 供电时 AO 可达 5V，STM32 的 ADC 引脚上限 3.3V。
+  必须 R1=10k（上臂）、R2=20k（下臂），分压比 20/(10+20)=0.667，5V→3.33V。分压中点接 PA0。<b>漏掉这一步会直接打坏 PA0。</b>
+</div>
+
+<h3>2.3 供电预算（USB 口 500mA 上限）</h3>
+<table>
+<thead><tr><th>负载</th><th>电压轨</th><th>电流</th></tr></thead>
+<tbody>
+<tr><td>Blue Pill 模块自身</td><td>3.3V</td><td>≈40mA</td></tr>
+<tr><td>DHT11</td><td>3.3V</td><td>≈1mA（测量瞬时）</td></tr>
+<tr><td>BH1750</td><td>3.3V</td><td>≈0.2mA</td></tr>
+<tr><td>MQ-2 加热丝</td><td><b>5V</b></td><td>≈150mA（冷启动瞬间更高）</td></tr>
+<tr><td colspan="2"><b>3V3 轨合计</b></td><td><b>≈45mA</b>（模块稳压器可到 300mA，余量充足）</td></tr>
+<tr><td colspan="2"><b>5V 轨合计</b></td><td><b>≈150mA</b>（USB 500mA 上限内）</td></tr>
+</tbody>
+</table>
+<p class="small">结论：<b>用 Blue Pill 自带 Micro-USB 口供电就够了</b>，不需要额外的 DC 电源座和独立稳压电路——这正是换回模块版最省事的地方。</p>
+
+<h2>3. Proteus 器件库对照表（照着搜，避免搜不到）</h2>
+<table>
+<thead><tr><th>原理图器件</th><th>Proteus 里搜什么</th><th>库 / 状态</th></tr></thead>
+<tbody>
+<tr><td>STM32F103C8T6</td><td><code>STM32F103C8</code></td><td><span class="tag ok">CM3_STM32.LIB</span> 已验证</td></tr>
+<tr><td>电阻（10k / 20k / 4.7k）</td><td><code>RES</code></td><td><span class="tag ok">DEVICE.LIB</span></td></tr>
+<tr><td>排针 / 接插件</td><td><code>CONN-SIL3</code> / <code>CONN-SIL4</code> / <code>CONN-SIL5</code></td><td><span class="tag ok">ACTIVE.LIB</span> 已验证</td></tr>
+<tr><td>网络标签（省线）</td><td>用 <code>WIRE LABEL</code> 标注 <code>3V3 / 5V / GND / mq2_adc</code></td><td><span class="tag ok">ISIS 内置</span></td></tr>
+<tr><td>电源 / 地符号</td><td><code>POWER</code> / <code>GROUND</code></td><td><span class="tag ok">DEVICE.LIB</span></td></tr>
+<tr><td>DHT11</td><td><code>DHT11</code></td><td><span class="tag ok">TRXD.LIB</span> 已验证，8.6+ 带仿真模型</td></tr>
+<tr><td>MQ-2</td><td>无模型 → 用 <code>POT-HG</code>（可调电阻）模拟 AO 电压</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+<tr><td>BH1750</td><td>无模型 → 用 <code>POT-HG</code> 或 <code>I2C</code> 从机模拟</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+<tr><td>CH340</td><td>无模型 → 用 <code>COMPIM</code> 或 <code>VIRTUAL TERMINAL</code> 代表串口</td><td><span class="tag no">PROTEUS 无</span></td></tr>
+<tr><td>ST-Link V2</td><td>不参与仿真 → 画 4 脚排针 <code>CONN-SIL4</code> 表示即可</td><td><span class="tag warn">不仿真</span></td></tr>
+</tbody>
+</table>
+<p class="small">库名已在你的 Proteus 8.17 安装目录 <code>DATA\LIBRARY</code> 中逐项核对过。标「无」的器件，仿真时按替代件处理；只画原理图则用任意符号 + 网络标签即可。</p>
+
+<h2>4. 元件清单（Blue Pill + 万能板焊接版 BOM）</h2>
+<table>
+<thead><tr><th>位号</th><th>器件</th><th>规格</th><th>数量</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>U1</td><td>STM32F103C8T6 最小系统板</td><td>Blue Pill（2×20 排针）</td><td>1</td><td>板载晶振/复位/稳压/USB，本方案核心</td></tr>
+<tr><td>U1座</td><td>单排母</td><td>20P / 2.54mm</td><td>2</td><td>做插座，模块可拆换（强烈建议）</td></tr>
+<tr><td>J1</td><td>单排母</td><td>3P / 2.54mm</td><td>1</td><td>DHT11 插座</td></tr>
+<tr><td>J2</td><td>单排母</td><td>4P / 2.54mm</td><td>1</td><td>MQ-2 插座</td></tr>
+<tr><td>J3</td><td>单排母</td><td>5P / 2.54mm</td><td>1</td><td>BH1750 插座</td></tr>
+<tr><td>J4</td><td>单排母</td><td>4P / 2.54mm</td><td>1</td><td>CH340 插座（也可直接焊漆包线）</td></tr>
+<tr><td>R1</td><td>金属膜电阻</td><td>10kΩ 1/4W</td><td>1</td><td>MQ-2 分压上臂</td></tr>
+<tr><td>R2</td><td>金属膜电阻</td><td>20kΩ 1/4W</td><td>1</td><td>MQ-2 分压下臂</td></tr>
+<tr><td>R3</td><td>金属膜电阻</td><td>4.7kΩ 1/4W</td><td>1</td><td>DHT11 上拉（3 针模块自带则可省，建议留着备用）</td></tr>
+<tr><td>—</td><td>万能板（洞洞板）</td><td>双面镀锡 5×7cm</td><td>1</td><td>建议 7×9cm 留余量，方便布线</td></tr>
+<tr><td>—</td><td>单排针 / 单排母</td><td>2.54mm</td><td>若干</td><td>备用与扩展</td></tr>
+<tr><td>—</td><td>焊锡丝 + 助焊剂</td><td>0.6mm 含铅或无铅</td><td>若干</td><td></td></tr>
+<tr><td>—</td><td>细漆包线 / 跳线</td><td>0.3~0.5mm</td><td>若干</td><td>板内飞线走线用</td></tr>
+<tr><td>—</td><td>铜柱 M3 + 螺丝</td><td>M3×8mm</td><td>4</td><td>垫高固定，防止底部短路</td></tr>
+<tr><td>DHT11</td><td>温湿度模块</td><td>3P（自带 4.7k 上拉）</td><td>1</td><td></td></tr>
+<tr><td>MQ-2</td><td>烟雾 / 可燃气体模块</td><td>4P</td><td>1</td><td><b>5V 供电</b></td></tr>
+<tr><td>BH1750</td><td>光照模块 GY-302</td><td>5P</td><td>1</td><td>3.3V</td></tr>
+<tr><td>CH340</td><td>USB 转 TTL 模块</td><td>—</td><td>1</td><td>接 PC；建议自带 3.3V/5V 电平跳线</td></tr>
+<tr><td>ST-Link V2</td><td>下载 / 调试器</td><td>—</td><td>1</td><td>烧录与调试</td></tr>
+<tr><td>—</td><td>Micro-USB 数据线</td><td>—</td><td>2</td><td>一个给 Blue Pill 供电，一个给 CH340 接 PC</td></tr>
+</tbody>
+</table>
+<p class="small">相比裸片版，少掉了：LQFP48 芯片与转接板、AMS1117、晶振、复位按键、BOOT 跳线、USB 座、电感/磁珠、13 只电容、5 只电阻。<b>焊接点数从 100+ 降到 40 左右。</b></p>
+
+<h2>5. 万能板焊接装配指南</h2>
+
+<h3>5.1 布局规划（先在纸上排一遍再动锡）</h3>
+<ul>
+<li><b>中央偏上</b>：Blue Pill 的 2×20 排母座，<b>USB 口朝板边</b>，插上模块后数据线不挡其它件。</li>
+<li><b>USB 口一侧留空</b>：至少留 15mm，否则 USB 线插不进去。</li>
+<li><b>板边</b>：四个模块排母分散放在三边，DHT11 尽量远离 MQ-2（MQ-2 加热丝发热会影响温湿度读数）。</li>
+<li><b>靠 PA0 附近</b>：R1/R2 分压电阻紧挨着放在 PA0 引出脚旁边，节点到 PA0 的线越短越好。</li>
+<li><b>电源干线</b>：在万能板上用三根「加锡堆粗」的线分别做 <b>3V3 / 5V / GND</b> 干线（或各用一根镀锡铜线沿板边走），所有器件就近搭接。</li>
+<li><b>GND 走星形</b>：所有模块的地都单独汇到同一根地干线，不要串联成一条长链，避免地环路。</li>
+</ul>
+
+<h3>5.2 焊接顺序</h3>
+<ol>
+<li>先焊 <b>电阻 R1 / R2 / R3</b>——最矮，不受后面元件遮挡。</li>
+<li>再焊 <b>所有排母座</b>（Blue Pill 的 2×20、四个模块插座）——高，且焊点多，先做完便于后面飞线。</li>
+<li>然后焊 <b>电源干线</b>（3V3 / 5V / GND 三根加锡线）。</li>
+<li>最后走 <b>信号飞线</b>（漆包线按第 2 节的连接表逐条飞）。</li>
+<li>焊完 <b>先不要插模块</b>，用万用表检查：各排母的电源脚与地之间<b>不短路</b>。</li>
+</ol>
+
+<div class="box green">
+  <b>先验电、再插模块，这一步不能省。</b><br>
+  排母与飞线焊完后，插上 Blue Pill（模块不接任何传感器），通电看 <b>PWR LED 是否亮</b>，再用万用表量排母上的 <code>3V3</code> 与 <code>5V</code> 排针电压是否分别为 3.3V 和 5V。<br>
+  确认无误后，<b>断电</b>再逐个插上 DHT11 / MQ-2 / BH1750 / CH340。这样即使某处焊错，烧的也只是模块而不是全套传感器。
+</div>
+
+<h3>5.3 走线与工艺要点</h3>
+<ul>
+<li>电源线和地线走粗：多用几个焊盘串联，或沿走线加锡堆厚，降低压降。</li>
+<li>信号线用 0.3~0.5mm 漆包线飞线，走最短路径，尽量贴着板面走，避免交叉时压到元件脚。</li>
+<li><b>MQ-2 节点A 到 PA0 的线尽量短</b>，且远离 5V 走线和 MQ-2 加热丝回路（否则 ADC 读数会带噪声）。</li>
+<li>I²C（PB6/PB7）与串口（PA9/PA10）分开走，不要长距离平行，避免串扰。</li>
+<li>Blue Pill 排针比较密，飞线从排针之间穿出时注意<b>不要蹭到相邻焊盘</b>；焊完用放大镜或万用表逐对测一遍相邻脚是否短路。</li>
+<li>MQ-2 有加热丝，长期通电会微热属正常；但<b>不要用热熔胶把它封死</b>，要留散热。</li>
+<li>DHT11 建议不要直接焊在板上，用 3P 排母做插座并让它稍微「架空」出板面，避免板子自身温升影响读数。</li>
+</ul>
+
+<h2>6. 仿真设置与避坑清单（与你的代码直接相关）</h2>
+<div class="box blue">
+  <b>Proteus 里必做：</b>
+  <ol style="margin:6px 0">
+    <li>双击 U1（<code>STM32F103C8</code>），<code>Program File</code> 指向 Keil 编出的 <code>.hex</code>。</li>
+    <li><code>Crystal Frequency</code> 设为 <b>8MHz</b>（与 Blue Pill 板载晶振一致）。这一项必须和代码里 <code>SystemInit</code> 的配置一致，否则串口波特率和所有软件延时全错。</li>
+    <li>Proteus 的 STM32 模型运行用的是模型内部时钟，若代码切了外部晶振，先确认模型属性里的频率与之一致；不一致会直接跑飞。</li>
+  </ol>
+</div>
+<ul>
+<li><b>MQ-2 / BH1750 / CH340 在 Proteus 里没有模型</b>，仿真时分别用 <code>POT-HG</code> / I²C 从机 / <code>COMPIM</code> 替代，只验证 ADC 读值与 I²C、串口时序即可。</li>
+<li><b>DHT11 仿真模型时序容差比实物宽</b>，仿真能通不代表实物能通，实物上要单独用逻辑分析仪看 DATA 时序。</li>
+<li>数值缩放：温度/湿度 ×10（25.6℃ → 0x0100），烟雾/光照<b>不缩放</b>（312 → 0x0138）——别统一乘 10。</li>
+<li><b>ST-Link 的 3.3V 不要接。</b> 板子已经由 Micro-USB 供电，再接 ST-Link 的 3.3V 就是两个电源顶在一起。只接 SWDIO / SWCLK / GND 三根。</li>
+<li><b>CH340 的 VCC 不要接。</b> 它由自己的 USB 口供电，只接 TXD / RXD / GND 三根最干净，也能避免和板子电源打架。若你的模块是 5V 电平版，记得把跳线挪到 <b>3.3V</b> 档。</li>
+<li><b>CH340 必须与板子共地</b>，只接 TX/RX 不接地是"能通电但不通信"最常见的原因。</li>
+<li>MQ-2 上电后要<b>预热 2~3 分钟</b>读数才稳定，刚上电时的烟雾值偏高属正常。</li>
+<li>Blue Pill 的 BOOT0 跳线：平时保持 0（板上丝印 <code>0</code> 一侧），用 ST-Link 烧录无需改动；只有走串口 ISP 才需要跳到 1，烧完记得跳回。</li>
+</ul>
+
+<h2>7. 与两版旧图的关系</h2>
+<table>
+<thead><tr><th>文件</th><th>主控</th><th>装配</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td><code>原理图参考.html</code></td><td>Blue Pill 模块</td><td>面包板 + 杜邦线</td><td>快速验证原型</td></tr>
+<tr><td><code>原理图参考-裸片焊接版.html</code></td><td>STM32F103C8T6 裸芯片</td><td>万能板焊接</td><td>需要自建最小系统</td></tr>
+<tr><td><b>本文件</b></td><td><b>Blue Pill 模块</b></td><td><b>万能板焊接</b></td><td><b>本方案：成品化、可长期运行、焊接量适中</b></td></tr>
+</tbody>
+</table>
+<p class="small">三版的<b>信号分配完全一致</b>：DHT11→PB5、MQ-2→PA0(10k/20k 分压)、BH1750→PB6/PB7、CH340→PA9/PA10、SWD→PA13/PA14。固件与 <code>接线表.md</code> 不需要任何改动。</p>
+
+<hr>
+<p class="small">配套文件：<code>接线表.md</code>（接线基准）、<code>原理图参考.html</code>（模块版 · 面包板）、<code>原理图参考-裸片焊接版.html</code>（裸片焊接版）、本文件（模块焊接版）。<br>
+本文件是「连接拓扑 + 引脚总表 + BOM + 焊接工艺」，保证连接正确；Proteus 里的器件外形符号按第 3 节对照表选择。</p>
+
+</div>
+</body>
+</html>

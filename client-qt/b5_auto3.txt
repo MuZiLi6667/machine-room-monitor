@@ -1,0 +1,6 @@
+AUTO_RESULT frames=15 dropped=0 points=60 uiTicks=60 bytes=270 last=20.5;54.3;242;445 run_seconds=30
+tcp=LOGGED_IN loginOk=1 dataSent=15 hbSent=0 reconnects=0 badJson=0 analysis=0 alarm=0
+curve0 n=15 key=[1790092510..1790092538] val=[20..20.8] yaxis=[0..21.3]
+curve1 n=15 key=[1790092510..1790092538] val=[53.9..55.1] yaxis=[0..56.2]
+curve2 n=15 key=[1790092510..1790092538] val=[216..247] yaxis=[0..251.65]
+curve3 n=15 key=[1790092510..1790092538] val=[391..461] yaxis=[0..471.5]

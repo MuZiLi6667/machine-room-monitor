@@ -1,0 +1,1 @@
+AUTO_RESULT frames=8 dropped=0 points=32 uiTicks=30 bytes=144 last=24.9;55.3;204;400 run_seconds=15

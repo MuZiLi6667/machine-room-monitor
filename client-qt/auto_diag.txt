@@ -1,0 +1,5 @@
+AUTO_RESULT frames=13 dropped=0 points=52 uiTicks=52 bytes=234 last=26.9;62.4;449;179 run_seconds=26
+curve0 n=13 key=[1790090147..1790090171] val=[26.7..27.4]
+curve1 n=13 key=[1790090147..1790090171] val=[62.4..63.4]
+curve2 n=13 key=[1790090147..1790090171] val=[426..450]
+curve3 n=13 key=[1790090147..1790090171] val=[165..209]

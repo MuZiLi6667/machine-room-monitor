@@ -1,0 +1,6 @@
+AUTO_RESULT frames=17 dropped=0 points=68 uiTicks=68 bytes=306 last=23.4;57.2;210;178 run_seconds=34
+tcp=LOGGED_IN loginOk=1 dataSent=17 hbSent=1 reconnects=0 badJson=0 analysis=8 alarm=5
+curve0 n=17 key=[1790091634..1790091666] val=[21.8..23.4] yaxis=[0..23.64]
+curve1 n=17 key=[1790091634..1790091666] val=[57..59.1] yaxis=[0..60.4]
+curve2 n=17 key=[1790091634..1790091666] val=[210..256] yaxis=[0..262.9]
+curve3 n=17 key=[1790091634..1790091666] val=[162..213] yaxis=[0..220.65]

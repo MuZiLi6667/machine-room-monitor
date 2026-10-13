@@ -1,0 +1,20 @@
+[b4-server] listening on 0.0.0.0:9002
+[+] client connected from ('127.0.0.1', 57908)
+[LOGIN] AUTO-CLIENT
+[DATA #1] 4 sensors
+[DATA #2] 4 sensors
+[DATA #3] 4 sensors
+[DATA #4] 4 sensors
+[DATA #5] 4 sensors
+[DATA #6] 4 sensors
+[DATA #7] 4 sensors
+[DATA #8] 4 sensors
+[->] ERROR pushed
+[DATA #9] 4 sensors
+[DATA #10] 4 sensors
+[DATA #11] 4 sensors
+[DATA #12] 4 sensors
+[DATA #13] 4 sensors
+[DATA #14] 4 sensors
+[DATA #15] 4 sensors
+[-] client disconnected, waiting for reconnect...
