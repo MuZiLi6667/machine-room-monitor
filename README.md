@@ -64,6 +64,23 @@ windeployqt release/client.exe      # 部署 Qt 运行库到 release/
 把 `release/` 整个目录拷给使用者即可运行（exe + 全部 DLL），
 运行说明见 `client-qt/使用说明.txt`。
 
+想打包成**免安装单文件版**（WinRAR 自解压包）时，先造一个配置文件 `sfx_config.txt`：
+
+```
+Setup=client.exe
+TempMode
+Silent=1
+Overwrite=1
+```
+
+再执行（注意在部署目录内打包，压缩包根层就是 `client.exe`）：
+
+```bash
+cd client-qt/机房环境监测客户端
+"C:/Program Files/WinRAR/Rar.exe" a -r -sfx -z../sfx_config.txt \
+    "../机房环境监测客户端-单文件版.exe" "*"
+```
+
 ### 服务器（Ubuntu）
 
 见 `server-linux/运行说明.md`（依赖安装、建库、编译、运行与联调步骤）。
