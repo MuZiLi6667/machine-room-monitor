@@ -1,7 +1,7 @@
 (export
 	(version "E")
 	(design
-		(source "C:\\Users\\15373\\WorkBuddy\\2026-09-21-15-10-23\\machine-room-monitor\\hardware\\output\\machine-room-monitor-taskA.kicad_sch")
+		(source "C:\\Users\\15373\\WorkBuddy\\2026-09-21-15-10-23\\machine-room-monitor\\hardware\\output\\machine-room-monitor-schematic.kicad_sch")
 		(date "2026-10-09T23:20:39")
 		(tool "Eeschema 10.0.6")
 		(sheet
@@ -9,11 +9,11 @@
 			(name "/")
 			(tstamps "/")
 			(title_block
-				(title "机房环境监测系统 · 任务A 单片机端原理图")
+				(title "机房环境监测系统 · 单片机端原理图")
 				(company)
 				(rev "A")
 				(date "2026-10-09")
-				(source "machine-room-monitor-taskA.kicad_sch")
+				(source "machine-room-monitor-schematic.kicad_sch")
 				(comment
 					(number "1")
 					(value "主控 STM32F103C8T6（实物为 Blue Pill 开发板，板上已集成晶振/复位/稳压）")
@@ -79,7 +79,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -133,7 +133,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -187,7 +187,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -241,7 +241,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -295,7 +295,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -349,7 +349,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -403,7 +403,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -457,7 +457,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(sheetpath
 				(names "/")
@@ -509,7 +509,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(sheetpath
 				(names "/")
@@ -561,7 +561,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -615,7 +615,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -669,7 +669,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -723,7 +723,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -777,7 +777,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -831,7 +831,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -881,7 +881,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -1073,7 +1073,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")
@@ -1133,7 +1133,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(sheetpath
 				(names "/")
@@ -1185,7 +1185,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(sheetpath
 				(names "/")
@@ -1240,7 +1240,7 @@
 			)
 			(property
 				(name "Sheetfile")
-				(value "../output/machine-room-monitor-taskA.kicad_sch")
+				(value "../output/machine-room-monitor-schematic.kicad_sch")
 			)
 			(property
 				(name "ki_keywords")

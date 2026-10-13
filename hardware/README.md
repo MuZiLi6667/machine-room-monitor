@@ -1,19 +1,19 @@
-# 任务A · 机房环境监测系统（单片机端）原理图
+# 机房环境监测系统（单片机端）原理图
 
-本目录是「任务A 单片机端」的原理图交付，包含 **Proteus** 和 **KiCad** 两种格式，
+本目录是「单片机端」的原理图交付，包含 **Proteus** 和 **KiCad** 两种格式，
 电气连接均与 `stm32-firmware/接线表.md` 一致。
 
 ## 交付文件一览
 
 | 文件 | 说明 |
 | --- | --- |
-| `output/machine-room-monitor-taskA.pdsprj` | **Proteus 工程**（双击用 Proteus 打开） |
-| `output/machine-room-monitor-taskA.PDF` | 原理图 PDF（由 Proteus 导出，可直接看/打印/交作业） |
-| `output/machine-room-monitor-taskA.png` | 原理图图片版（200dpi，手机/微信预览用） |
-| `output/machine-room-monitor-taskA.kicad_sch` | KiCad 10 原理图（备用格式，可继续编辑/改 PCB） |
-| `output/machine-room-monitor-taskA.net` | KiCad 导出的网表（校验用，不必打开） |
+| `output/machine-room-monitor-schematic.pdsprj` | **Proteus 工程**（双击用 Proteus 打开） |
+| `output/machine-room-monitor-schematic.PDF` | 原理图 PDF（由 Proteus 导出，可直接看/打印/交作业） |
+| `output/machine-room-monitor-schematic.png` | 原理图图片版（200dpi，手机/微信预览用） |
+| `output/machine-room-monitor-schematic.kicad_sch` | KiCad 10 原理图（备用格式，可继续编辑/改 PCB） |
+| `output/machine-room-monitor-schematic.net` | KiCad 导出的网表（校验用，不必打开） |
 | `output/erc.rpt` | KiCad 的 ERC 电气规则检查报告（0 个错误） |
-| `output/svg/machine-room-monitor-taskA.svg` | KiCad 版矢量图（浏览器可直接看） |
+| `output/svg/machine-room-monitor-schematic.svg` | KiCad 版矢量图（浏览器可直接看） |
 
 ## 怎么打开（一步一步来）
 
@@ -21,22 +21,22 @@
 
 1. 打开「文件资源管理器」，进到
    `C:\Users\15373\WorkBuddy\2026-09-21-15-10-23\machine-room-monitor\hardware\output`
-2. **双击** `machine-room-monitor-taskA.pdsprj`
+2. **双击** `machine-room-monitor-schematic.pdsprj`
 3. 应该看到：Proteus 启动，标题栏写着
-   `machine-room-monitor-taskA - Proteus 8 Professional - 原理图绘制`
+   `machine-room-monitor-schematic - Proteus 8 Professional - 原理图绘制`
 4. 如果只看到局部：按一下 **F8**（查看整张图纸），或菜单「视图(V) → 查看整张图纸」
 
 > 双击没反应时：先打开 Proteus，菜单「文件(F) → 打开工程(O)」，选这个 `.pdsprj` 文件。
 
 ### 看 PDF 版
 
-直接双击 `machine-room-monitor-taskA.PDF`，任何 PDF 阅读器都能打开，
+直接双击 `machine-room-monitor-schematic.PDF`，任何 PDF 阅读器都能打开，
 内容和 Proteus 版一模一样，适合打印和交作业。
 
 ### 看 KiCad 版
 
-双击 `machine-room-monitor-taskA.kicad_sch`（需已装 KiCad 10）。
-快速浏览用浏览器打开 `output/svg/machine-room-monitor-taskA.svg` 即可。
+双击 `machine-room-monitor-schematic.kicad_sch`（需已装 KiCad 10）。
+快速浏览用浏览器打开 `output/svg/machine-room-monitor-schematic.svg` 即可。
 
 ## 电路内容（对照接线表）
 
@@ -84,7 +84,7 @@
 KiCad 命令行检查（在 `hardware` 目录里敲）：
 
 ```
-kicad-cli sch erc output/machine-room-monitor-taskA.kicad_sch -o output/erc.rpt
+kicad-cli sch erc output/machine-room-monitor-schematic.kicad_sch -o output/erc.rpt
 ```
 
 期望输出：`0 Errors`（4 个 Warning 是“module 库未配置”的提示，可忽略）。

@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 TCP 探测工具（双模式）—— 按接口规范 §3 收发 JSON 消息
-  模式1 假服务器：给客户端（任务B）当对端，验证客户端的登录/转发/重连
+  模式1 假服务器：给客户端当对端，验证客户端的登录/转发/重连
       python server_probe.py server -p 9000
-  模式2 假客户端：给服务器（任务C）当对端，登录并发送2秒周期的 DATA，打印收到的 ANALYSIS/ALARM
+  模式2 假客户端：给服务器当对端，登录并发送2秒周期的 DATA，打印收到的 ANALYSIS/ALARM
       python server_probe.py client -H <服务器IP> -p 9000 --id PC-01
 依赖：仅标准库
 """

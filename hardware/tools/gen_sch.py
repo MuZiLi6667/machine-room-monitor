@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-r"""生成「机房环境监测系统 · 任务A 单片机端」原理图 (.kicad_sch)。
+r"""生成「机房环境监测系统 · 单片机端」原理图 (.kicad_sch)。
 
-依据: stm32-firmware/接线表.md + docs/任务A-单片机端.md + User/*.c 源码
+依据: stm32-firmware/接线表.md + docs/单片机端.md + User/*.c 源码
 布局: A3 图纸，裸芯片 + 完整最小系统 + 三个传感器模块 + 串口 + SWD。
 规范: 所有坐标对齐 1.27mm 连接网格；电源网络配 PWR_FLAG。
 """
@@ -22,7 +22,7 @@ def g(v):
 
 
 sch = Sch(paper="A3",
-          title="机房环境监测系统 · 任务A 单片机端原理图",
+          title="机房环境监测系统 · 单片机端原理图",
           date="2026-10-09", rev="A",
           comments=(
               "主控 STM32F103C8T6（实物为 Blue Pill 开发板，板上已集成晶振/复位/稳压）",
@@ -252,6 +252,6 @@ for x, y, s in notes:
     sch.text(s, x, y)
 
 # ============ 输出 ============
-path = os.path.join(OUT, "machine-room-monitor-taskA.kicad_sch")
+path = os.path.join(OUT, "machine-room-monitor-schematic.kicad_sch")
 sch.save(path)
 print("saved:", path)

@@ -38,7 +38,7 @@ constexpr qint64 kOfflineMs = 6000; // >6s 无数据视为离线
 }  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle("机房环境多指标监测客户端 - 任务B");
+    setWindowTitle("机房环境多指标监测客户端");
     clock_.start();
     buildUi();
 

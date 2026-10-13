@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""生成「机房环境监测系统 · 任务A」Proteus 原理图 (.pdsprj)。
+"""生成「机房环境监测系统 · 单片机端」Proteus 原理图 (.pdsprj)。
 
 坐标: 100000 = 1 mm，Y 向上；U1 原点在 (0,0)。
 依据: stm32-firmware/接线表.md
@@ -23,12 +23,12 @@ import compat
 from proteus_automatic_api import Circuit
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   '..', '..', 'output', 'machine-room-monitor-taskA.pdsprj')
+                   '..', '..', 'output', 'machine-room-monitor-schematic.pdsprj')
 OUT = os.path.abspath(OUT)
 
 MM = 100000
 c = Circuit(template_project=compat.TEMPLATE)
-c._title = "机房环境监测系统 - 任务A 单片机端"
+c._title = "机房环境监测系统 - 单片机端"
 
 # ---------- 导入器件 ----------
 for dev, lib in [('STM32F103C8', 'CM3_STM32'), ('DHT11', 'TRXD'),

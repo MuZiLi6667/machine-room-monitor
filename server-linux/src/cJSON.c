@@ -89,7 +89,7 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
-/* 本地补丁（任务C S2，与上游 v1.7.18 的唯一差异）：加 __thread。
+/* 本地补丁（服务器端 S2，与上游 v1.7.18 的唯一差异）：加 __thread。
  * 上游用一个进程级全局记录"最近一次解析错误"，而每次 cJSON_Parse* 都会重置
  * 并可能写入它（见下方 1110/1111 与 fail 分支）。本服务器在 4 个工作线程里
  * 并发解析 JSON，Helgrind 实测报出对该全局的数据竞争（写-写，无锁）。

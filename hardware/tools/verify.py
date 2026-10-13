@@ -7,7 +7,7 @@ import re
 import sys
 
 NET = sys.argv[1] if len(sys.argv) > 1 else \
-    r"C:\Users\15373\WorkBuddy\2026-09-21-15-10-23\machine-room-monitor\hardware\output\machine-room-monitor-taskA.net"
+    r"C:\Users\15373\WorkBuddy\2026-09-21-15-10-23\machine-room-monitor\hardware\output\machine-room-monitor-schematic.net"
 
 # ---- 期望连接（依据 stm32-firmware/接线表.md）----
 EXPECTED = [

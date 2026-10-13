@@ -1,6 +1,6 @@
 # 机房环境多指标远程监测与分析系统
 
-通信系统综合设计（DX702006）· 3人小组 · 2026.9.21 – 10.13
+通信系统综合设计（DX702006）· 2026.9.21 – 10.13
 
 ## 系统链路
 
@@ -14,45 +14,45 @@ DHT11/MQ-2/BH1750 → STM32F103C8T6 (UART帧协议) → USB转TTL → Qt客户�
 
 原理图与实物照片见 [`docs/图片/`](docs/图片/)。
 
-## 文档导航（三人协作从这里开始）
+## 文档导航
 
 | 文档 | 用途 |
 |---|---|
 | `docs/接口规范.md` | **三端契约（必读）**：串口帧协议+TCP JSON协议+数据库，含冻结的测试向量 |
 | `docs/系统设计方案.md` | 总体设计：架构、选型、计划（报告底稿） |
-| `docs/任务A-单片机端.md` | 分工任务书：分步任务+验收标准+参考链接 |
-| `docs/任务B-客户端.md` | 分工任务书：同上 |
-| `docs/任务C-服务器端.md` | 分工任务书：同上 |
-| `docs/调试记录-C.md` | 服务器端调试全过程记录（问题清单与定位） |
+| `docs/单片机端.md` | 开发文档：分步任务+验收标准+参考链接 |
+| `docs/客户端.md` | 开发文档：同上 |
+| `docs/服务器端.md` | 开发文档：同上 |
+| `docs/服务器端-调试记录.md` | 服务器端调试全过程记录（问题清单与定位） |
 | `docs/虚拟机固定IP操作指南.md` | 服务器虚拟机固定 IP 设置步骤 |
 
-> 各自的Agent工具接手时：**第一步读接口规范，第二步读自己的任务书**，接口字段不得擅改。
+> Agent 工具接手时：**第一步读接口规范，第二步读对应的开发文档**，接口字段不得擅改。
 
 ## 目录结构
 
 ```
 machine-room-monitor/
 ├── docs/                 文档（见上表）+ 报告用图片（docs/图片/）
-├── stm32-firmware/       任务A交付：Keil工程 + 源码 + 标准库 + 接线表
-├── hardware/             任务A交付：原理图（Proteus/KiCad 双版本 + 生成脚本）
-├── client-qt/            任务B交付：Qt源码 + 使用说明 + 验收证据/
-├── server-linux/         任务C交付：源码 + Makefile + sql/init.sql + 运行说明.md
+├── stm32-firmware/       单片机端：Keil工程 + 源码 + 标准库 + 接线表
+├── hardware/             单片机端：原理图（Proteus/KiCad 双版本 + 生成脚本）
+├── client-qt/            客户端：Qt源码 + 使用说明 + 验收证据/
+├── server-linux/         服务器端：源码 + Makefile + sql/init.sql + 运行说明.md
 └── simulator/            共享联调工具（见下）
 ```
 
 > 仓库只收录源码与验收证据；编译产物与发布包（对象文件、hex/exe、
 > Qt 运行库、打包 zip）不入库，自行构建见下一节。
 > `client-qt/验收证据/` 为客户端 8 项验收数据与 7 份联试日志，
-> 与 `client-qt/任务B客户端资产清单.md` 一一对应。
+> 与 `client-qt/客户端资产清单.md` 一一对应。
 
 ## 自己编译 / 打包
 
-### 任务A · 单片机端（Keil MDK）
+### 单片机端（Keil MDK）
 
 打开 `stm32-firmware/MDK-ARM/machine-room-monitor.uvprojx` 编译，
 hex 生成在 `MDK-ARM/Objects/`；接线与烧录见 `stm32-firmware/接线表.md`。
 
-### 任务B · 客户端（Qt 6 + MinGW）
+### 客户端（Qt 6 + MinGW）
 
 ```bash
 cd client-qt
@@ -64,7 +64,7 @@ windeployqt release/client.exe      # 部署 Qt 运行库到 release/
 把 `release/` 整个目录拷给使用者即可运行（exe + 全部 DLL），
 运行说明见 `client-qt/使用说明.txt`。
 
-### 任务C · 服务器（Ubuntu）
+### 服务器（Ubuntu）
 
 见 `server-linux/运行说明.md`（依赖安装、建库、编译、运行与联调步骤）。
 
@@ -98,7 +98,7 @@ python simulator/verify_vectors.py
 
 ## 实施顺序建议
 
-1. 各自按任务书独立开发（B/C 用 simulator 自测，不等队友）
-2. B+C 先拼合（客户端↔服务器，跑通JSON链路）
-3. A 真机接入替换模拟器
+1. 按开发文档推进各模块（客户端/服务器用 simulator 自测）
+2. 客户端↔服务器先行拼合，跑通 JSON 链路
+3. 单片机真机接入替换模拟器
 4. 按接口规范§6联调清单验收 → 报告

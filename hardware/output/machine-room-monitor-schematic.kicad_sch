@@ -5,7 +5,7 @@
 	(uuid "d171c65e-2a08-4abc-9722-b09bc721a8df")
 	(paper "A3")
 	(title_block
-		(title "机房环境监测系统 · 任务A 单片机端原理图")
+		(title "机房环境监测系统 · 单片机端原理图")
 		(date "2026-10-09")
 		(rev "A")
 		(comment 1 "主控 STM32F103C8T6（实物为 Blue Pill 开发板，板上已集成晶振/复位/稳压）")

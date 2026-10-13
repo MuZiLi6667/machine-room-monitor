@@ -4,14 +4,14 @@ server-linux/server
 *.o
 *.d
 
-# 任务A（Keil）产物
+# 单片机端（Keil）产物
 stm32-firmware/**/Objects/
 stm32-firmware/**/Listings/
 stm32-firmware/**/*.hex
 stm32-firmware/**/*.axf
 stm32-firmware/**/*.uvguix.*
 
-# 任务B（Qt）产物
+# 客户端（Qt）产物
 client-qt/**/build-*/
 client-qt/**/*.pro.user
 client-qt/release/
@@ -23,7 +23,7 @@ client-qt/*.exe
 client-qt/moc_*
 client-qt/ui_*
 
-# 任务B（Qt）发布包：windeployqt 部署的运行库与打包目录。
+# 客户端（Qt）发布包：windeployqt 部署的运行库与打包目录。
 # 交付给用户的 exe/zip 体积大且可由源码重新生成，不入库；
 # 重新打包方法见 client-qt/使用说明.txt 与 README「自己编译」一节。
 client-qt/*.dll
